@@ -48,6 +48,7 @@ tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
     "net",
+    "test-util",
 ] }
 tonic = { version = "0.14" }
 async-stream = "0.3"

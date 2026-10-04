@@ -1823,6 +1823,298 @@ mod tests {
         watcher
     }
 
+    #[derive(Clone, Copy)]
+    enum ReconnectPhase {
+        Build,
+        Stream,
+        #[cfg(feature = "codegen-prost")]
+        Backoff,
+    }
+
+    struct GatedBuilder {
+        inner: crate::transport::mock::MockTransportBuilder,
+        phase: ReconnectPhase,
+        gates: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    }
+
+    struct GatedTransport {
+        inner: MockTransport,
+        phase: ReconnectPhase,
+        gates: mpsc::UnboundedSender<oneshot::Sender<()>>,
+    }
+
+    async fn connection_gate(gates: &mpsc::UnboundedSender<oneshot::Sender<()>>) -> Result<()> {
+        let (release, wait) = oneshot::channel();
+        gates.send(release).map_err(|_| Error::StreamClosed)?;
+        wait.await.map_err(|_| Error::StreamClosed)
+    }
+
+    impl TransportBuilder for GatedBuilder {
+        type Transport = GatedTransport;
+
+        async fn build(&self, server: &ServerConfig) -> Result<Self::Transport> {
+            if !matches!(self.phase, ReconnectPhase::Stream) {
+                connection_gate(&self.gates).await?;
+            }
+            Ok(GatedTransport {
+                inner: self.inner.build(server).await?,
+                phase: self.phase,
+                gates: self.gates.clone(),
+            })
+        }
+    }
+
+    impl Transport for GatedTransport {
+        type Sender = <MockTransport as Transport>::Sender;
+        type Receiver = <MockTransport as Transport>::Receiver;
+
+        async fn new_stream(&self) -> Result<(Self::Sender, Self::Receiver)> {
+            if matches!(self.phase, ReconnectPhase::Stream) {
+                connection_gate(&self.gates).await?;
+            }
+            self.inner.new_stream().await
+        }
+    }
+
+    #[cfg(feature = "codegen-prost")]
+    #[derive(Clone)]
+    struct ObservedRuntime {
+        sleeps: mpsc::UnboundedSender<Duration>,
+    }
+
+    #[cfg(feature = "codegen-prost")]
+    impl Runtime for ObservedRuntime {
+        fn spawn<F>(&self, future: F)
+        where
+            F: std::future::Future<Output = ()> + Send + 'static,
+        {
+            TokioRuntime.spawn(future);
+        }
+
+        async fn sleep(&self, duration: Duration) {
+            let _ = self.sleeps.send(duration);
+            TokioRuntime.sleep(duration).await;
+        }
+    }
+
+    #[cfg(feature = "codegen-prost")]
+    #[derive(Debug)]
+    struct EdsResource(envoy_types::pb::envoy::config::endpoint::v3::ClusterLoadAssignment);
+
+    #[cfg(feature = "codegen-prost")]
+    impl Resource for EdsResource {
+        type Message = envoy_types::pb::envoy::config::endpoint::v3::ClusterLoadAssignment;
+        const TYPE_URL: TypeUrl =
+            TypeUrl::new("type.googleapis.com/envoy.config.endpoint.v3.ClusterLoadAssignment");
+        const ALL_RESOURCES_REQUIRED_IN_SOTW: bool = false;
+
+        fn deserialize(bytes: Bytes) -> Result<Self::Message> {
+            use prost::Message;
+            Self::Message::decode(bytes).map_err(Error::Decode)
+        }
+
+        fn name(message: &Self::Message) -> &str {
+            &message.cluster_name
+        }
+
+        fn validate(message: Self::Message) -> Result<Self> {
+            if message.cluster_name.is_empty() {
+                return Err(Error::Validation("empty EDS resource name".into()));
+            }
+            Ok(Self(message))
+        }
+    }
+
+    #[cfg(feature = "codegen-prost")]
+    async fn cached_eds_during_reconnect(phase: ReconnectPhase) {
+        use envoy_types::pb::envoy::config::{core::v3 as core, endpoint::v3 as endpoint};
+        use envoy_types::pb::envoy::service::discovery::v3 as discovery;
+        use envoy_types::pb::google::protobuf::{Any, UInt32Value};
+        use prost::Message;
+
+        let (inner, mut servers) = mock_transport();
+        let (gates_tx, mut gates) = mpsc::unbounded_channel();
+        let (sleeps_tx, mut sleeps) = mpsc::unbounded_channel();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(None)
+            .with_retry_policy(crate::RetryPolicy::default().with_jitter(0.0).unwrap());
+        let client = XdsClient::builder(
+            config,
+            GatedBuilder {
+                inner,
+                phase,
+                gates: gates_tx,
+            },
+            crate::codec::prost::ProstCodec,
+            ObservedRuntime { sleeps: sleeps_tx },
+        )
+        .build();
+
+        let mut a = client.watch::<EdsResource>("cached-eds").await;
+        gates.recv().await.unwrap().send(()).unwrap();
+        let mut server = servers.recv().await.unwrap();
+        server.requests.recv().await.unwrap();
+        let assignment = endpoint::ClusterLoadAssignment {
+            cluster_name: "cached-eds".into(),
+            endpoints: vec![endpoint::LocalityLbEndpoints {
+                locality: Some(core::Locality {
+                    region: "region".into(),
+                    zone: "zone".into(),
+                    sub_zone: "subzone".into(),
+                }),
+                load_balancing_weight: Some(UInt32Value { value: 7 }),
+                lb_endpoints: vec![endpoint::LbEndpoint {
+                    health_status: core::HealthStatus::Healthy as i32,
+                    load_balancing_weight: Some(UInt32Value { value: 3 }),
+                    host_identifier: Some(endpoint::lb_endpoint::HostIdentifier::Endpoint(
+                        endpoint::Endpoint {
+                            address: Some(core::Address {
+                                address: Some(core::address::Address::SocketAddress(
+                                    core::SocketAddress {
+                                        address: "127.0.0.1".into(),
+                                        port_specifier: Some(
+                                            core::socket_address::PortSpecifier::PortValue(8080),
+                                        ),
+                                        ..Default::default()
+                                    },
+                                )),
+                            }),
+                            ..Default::default()
+                        },
+                    )),
+                    ..Default::default()
+                }],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        server
+            .responses
+            .send(Ok(Some(
+                discovery::DiscoveryResponse {
+                    version_info: "accepted-version".into(),
+                    nonce: "old-nonce".into(),
+                    type_url: EdsResource::TYPE_URL.as_str().into(),
+                    resources: vec![Any {
+                        type_url: EdsResource::TYPE_URL.as_str().into(),
+                        value: assignment.encode_to_vec(),
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .into(),
+            )))
+            .unwrap();
+        let (cached, done) = next_changed(&mut a).await;
+        let cached = cached.unwrap();
+        assert_eq!(cached.0, assignment);
+        drop(done);
+        let ack =
+            discovery::DiscoveryRequest::decode(server.requests.recv().await.unwrap()).unwrap();
+        assert_eq!(ack.version_info, "accepted-version");
+        assert_eq!(ack.response_nonce, "old-nonce");
+        server.responses.send(Ok(None)).unwrap();
+
+        // Observe backoff start instead of guessing with wall-clock sleeps.
+        let backoff = sleeps.recv().await.unwrap();
+        let gate = if matches!(phase, ReconnectPhase::Backoff) {
+            None
+        } else {
+            Some(gates.recv().await.unwrap())
+        };
+        let replay_started = tokio::time::Instant::now();
+        // A stays alive, so the last-watcher cache eviction cannot occur.
+        let mut b = client.watch::<EdsResource>("cached-eds").await;
+        let event = tokio::time::timeout(Duration::from_millis(100), b.next())
+            .await
+            .expect("cached replay blocked on reconnect")
+            .unwrap();
+        let ResourceEvent::ResourceChanged { result, done } = event else {
+            panic!("expected cached assignment");
+        };
+        let replayed = result.unwrap();
+        assert_eq!(replayed.0, assignment);
+        assert!(Arc::ptr_eq(&cached, &replayed));
+        // Keep the detached replay token across reconnection.
+        assert!(servers.try_recv().is_err());
+        assert!(
+            gates.try_recv().is_err(),
+            "commands restarted the connection attempt"
+        );
+        let gate = match gate {
+            Some(gate) => {
+                assert!(
+                    !gate.is_closed(),
+                    "commands cancelled the connection attempt"
+                );
+                gate
+            }
+            None => {
+                assert!(replay_started.elapsed() < backoff);
+                gates.recv().await.unwrap()
+            }
+        };
+
+        // Register and remove another subscription while setup is pending.
+        let removed = client.watch::<EdsResource>("removed-eds").await;
+        drop(removed);
+        let _added = client.watch::<EdsResource>("added-eds").await;
+        // A cached replay is a barrier for the preceding commands.
+        let mut barrier = client.watch::<EdsResource>("cached-eds").await;
+        drop(next_changed(&mut barrier).await);
+        gate.send(()).unwrap();
+        let mut replacement = servers.recv().await.unwrap();
+        let initial =
+            discovery::DiscoveryRequest::decode(replacement.requests.recv().await.unwrap())
+                .unwrap();
+        let mut names = initial.resource_names;
+        names.sort();
+        assert_eq!(names, ["added-eds", "cached-eds"]);
+        assert_eq!(initial.version_info, "accepted-version");
+        assert!(initial.response_nonce.is_empty());
+        // Neither the detached replay token nor old-session state blocks new reads.
+        replacement
+            .responses
+            .send(Ok(Some(
+                discovery::DiscoveryResponse {
+                    version_info: "next-version".into(),
+                    nonce: "new-nonce".into(),
+                    type_url: EdsResource::TYPE_URL.as_str().into(),
+                    resources: vec![Any {
+                        type_url: EdsResource::TYPE_URL.as_str().into(),
+                        value: assignment.encode_to_vec(),
+                    }],
+                    ..Default::default()
+                }
+                .encode_to_vec()
+                .into(),
+            )))
+            .unwrap();
+        let (updated, updated_done) = next_changed(&mut b).await;
+        let updated = updated.unwrap();
+        assert_eq!(updated.0, assignment);
+        assert!(!Arc::ptr_eq(&cached, &updated));
+        drop((done, updated_done));
+    }
+
+    #[cfg(feature = "codegen-prost")]
+    #[tokio::test(start_paused = true)]
+    async fn cached_eds_replayed_during_transport_build() {
+        cached_eds_during_reconnect(ReconnectPhase::Build).await;
+    }
+
+    #[cfg(feature = "codegen-prost")]
+    #[tokio::test(start_paused = true)]
+    async fn cached_eds_replayed_during_stream_creation() {
+        cached_eds_during_reconnect(ReconnectPhase::Stream).await;
+    }
+
+    #[cfg(feature = "codegen-prost")]
+    #[tokio::test(start_paused = true)]
+    async fn cached_eds_replayed_during_backoff() {
+        cached_eds_during_reconnect(ReconnectPhase::Backoff).await;
+    }
+
     /// Next event, unwrapped to its result and `ProcessingDone` token.
     async fn next_changed<T: Resource>(
         watcher: &mut ResourceWatcher<T>,
