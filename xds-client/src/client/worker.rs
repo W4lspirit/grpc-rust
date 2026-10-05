@@ -517,14 +517,14 @@ struct WatcherEntry {
 /// All inputs to the state actor share one FIFO message queue.
 /// Commands, timer expirations, and transport events are processed in enqueue
 /// order. Concurrent producers have no ordering guarantee before enqueueing.
-pub(crate) enum WorkerMessage {
-    Command(WorkerCommand),
+pub(crate) enum WorkerCommand {
+    Command(WatchCommand),
     Transport(TransportEvent),
     TransportStopped,
 }
 
 /// Commands sent from `XdsClient` to the worker.
-pub(crate) enum WorkerCommand {
+pub(crate) enum WatchCommand {
     /// Subscribe to a resource.
     Watch {
         /// The type URL of the resource.
@@ -587,9 +587,9 @@ pub(crate) struct AdsWorker<C, R> {
     /// Timeout for initial resource response (gRFC A57). None = disabled.
     resource_initial_timeout: Option<Duration>,
     /// Weak sender for timer callback commands, so AdsWorker does not keep its own channel open.
-    command_tx: mpsc::WeakUnboundedSender<WorkerMessage>,
+    command_tx: mpsc::WeakUnboundedSender<WorkerCommand>,
     /// Receiver for commands, timers, and transport events.
-    command_rx: mpsc::UnboundedReceiver<WorkerMessage>,
+    command_rx: mpsc::UnboundedReceiver<WorkerCommand>,
     /// Per-type_url state.
     type_states: HashMap<String, TypeState>,
     /// Cancellation handles for resource timers (gRFC A57).
@@ -610,8 +610,8 @@ where
         codec: C,
         runtime: R,
         config: ClientConfig,
-        command_tx: mpsc::UnboundedSender<WorkerMessage>,
-        command_rx: mpsc::UnboundedReceiver<WorkerMessage>,
+        command_tx: mpsc::UnboundedSender<WorkerCommand>,
+        command_rx: mpsc::UnboundedReceiver<WorkerCommand>,
         recorder: Option<Arc<dyn MetricsRecorder>>,
     ) -> Self {
         let target: Arc<str> = Arc::from(config.target.unwrap_or_default());
@@ -667,7 +667,7 @@ where
                 // Covers setup, backoff, I/O, and a held ProcessingDone token.
                 _ = shutdown_rx => {}
             }
-            let _ = send_worker_message(&command_tx, WorkerMessage::TransportStopped);
+            let _ = send_worker_command(&command_tx, WorkerCommand::TransportStopped);
         });
 
         let mut session: Option<ActiveSession> = None;
@@ -675,7 +675,7 @@ where
         // awaits inside a turn: a pending reconnect must not delay cached replay.
         while let Some(message) = self.command_rx.recv().await {
             let result = match message {
-                WorkerMessage::Command(cmd) => {
+                WorkerCommand::Command(cmd) => {
                     let sender = session
                         .as_ref()
                         .filter(|s| s.cancel.is_some())
@@ -684,10 +684,10 @@ where
                     demand_tx.send_replace(!self.type_states.is_empty());
                     result
                 }
-                WorkerMessage::Transport(event) => {
+                WorkerCommand::Transport(event) => {
                     self.handle_transport_event(event, &mut session, &mut healthy)
                 }
-                WorkerMessage::TransportStopped => break,
+                WorkerCommand::TransportStopped => break,
             };
             // Every protocol or write failure retires the stream the same way.
             if result.is_err()
@@ -800,10 +800,10 @@ where
     fn handle_command(
         &mut self,
         sender: Option<&mpsc::UnboundedSender<Bytes>>,
-        cmd: WorkerCommand,
+        cmd: WatchCommand,
     ) -> Result<()> {
         match cmd {
-            WorkerCommand::Watch {
+            WatchCommand::Watch {
                 type_url,
                 name,
                 watcher_id,
@@ -823,14 +823,14 @@ where
                     self.send_request(sender, type_url)?;
                 }
             }
-            WorkerCommand::Unwatch { watcher_id } => {
+            WatchCommand::Unwatch { watcher_id } => {
                 if let Some((type_url, true)) = self.remove_watcher(watcher_id)
                     && let Some(sender) = sender
                 {
                     self.send_request(sender, &type_url)?;
                 }
             }
-            WorkerCommand::ResourceTimerExpired { type_url, name } => {
+            WatchCommand::ResourceTimerExpired { type_url, name } => {
                 self.handle_resource_timeout(&type_url, &name);
             }
         }
@@ -1306,9 +1306,9 @@ where
         self.runtime.spawn(async move {
             tokio::select! {
                 _ = runtime.sleep(timeout) => {
-                    let _ = send_worker_message(
+                    let _ = send_worker_command(
                         &command_tx,
-                        WorkerMessage::Command(WorkerCommand::ResourceTimerExpired {
+                        WorkerCommand::Command(WatchCommand::ResourceTimerExpired {
                             type_url: type_url_owned,
                             name,
                         }),
@@ -1381,9 +1381,9 @@ impl ActiveSession {
 
 // Use a weak sender so background tasks don't prevent worker shutdown
 // after all client handles and watchers are dropped.
-fn send_worker_message(
-    command_tx: &mpsc::WeakUnboundedSender<WorkerMessage>,
-    message: WorkerMessage,
+fn send_worker_command(
+    command_tx: &mpsc::WeakUnboundedSender<WorkerCommand>,
+    message: WorkerCommand,
 ) -> Result<()> {
     command_tx
         .upgrade()
@@ -1399,7 +1399,7 @@ async fn run_transport<TB: TransportBuilder, R: Runtime>(
     runtime: R,
     server: ServerConfig,
     mut demand: watch::Receiver<bool>,
-    command_tx: &mpsc::WeakUnboundedSender<WorkerMessage>,
+    command_tx: &mpsc::WeakUnboundedSender<WorkerCommand>,
 ) {
     loop {
         // Do not connect without subscriptions. This latest-value signal is
@@ -1412,9 +1412,9 @@ async fn run_transport<TB: TransportBuilder, R: Runtime>(
         {
             let (writes, write_rx) = mpsc::unbounded_channel();
             let (cancel, cancelled) = oneshot::channel();
-            if send_worker_message(
+            if send_worker_command(
                 command_tx,
-                WorkerMessage::Transport(TransportEvent::Ready { writes, cancel }),
+                WorkerCommand::Transport(TransportEvent::Ready { writes, cancel }),
             )
             .is_err()
             {
@@ -1429,9 +1429,9 @@ async fn run_transport<TB: TransportBuilder, R: Runtime>(
         }
 
         let (retry, decision) = oneshot::channel();
-        if send_worker_message(
+        if send_worker_command(
             command_tx,
-            WorkerMessage::Transport(TransportEvent::Failed { retry }),
+            WorkerCommand::Transport(TransportEvent::Failed { retry }),
         )
         .is_err()
         {
@@ -1452,7 +1452,7 @@ async fn run_stream<T: Transport>(
     mut tx: T::Sender,
     mut rx: T::Receiver,
     mut writes: mpsc::UnboundedReceiver<Bytes>,
-    command_tx: &mpsc::WeakUnboundedSender<WorkerMessage>,
+    command_tx: &mpsc::WeakUnboundedSender<WorkerCommand>,
 ) {
     let write_loop = async {
         while let Some(bytes) = writes.recv().await {
@@ -1464,9 +1464,9 @@ async fn run_stream<T: Transport>(
     let read_loop = async {
         while let Ok(Some(bytes)) = rx.recv().await {
             let (done, processed) = ProcessingDone::channel();
-            if send_worker_message(
+            if send_worker_command(
                 command_tx,
-                WorkerMessage::Transport(TransportEvent::Response { bytes, done }),
+                WorkerCommand::Transport(TransportEvent::Response { bytes, done }),
             )
             .is_err()
             {
@@ -1837,7 +1837,7 @@ mod tests {
         let (done, processed) = ProcessingDone::channel();
         client
             .command_tx
-            .send(WorkerMessage::Transport(TransportEvent::Response {
+            .send(WorkerCommand::Transport(TransportEvent::Response {
                 bytes: response("1", "nonce", &["res-0"]),
                 done,
             }))
