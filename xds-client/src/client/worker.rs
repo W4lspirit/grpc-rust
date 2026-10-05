@@ -870,29 +870,6 @@ where
         let old_subscription = type_state.subscription.clone();
         let watcher_subscription = WatcherSubscription::from_name(name.clone());
 
-        // Keep wildcard forwarding separate for now. The unbounded channel
-        // buffers a whole response without blocking the actor. A follow-up can
-        // batch notifications per response instead of forwarding each resource.
-        let event_tx = if watcher_subscription.is_wildcard() {
-            let (forward_tx, mut forward_rx) = mpsc::unbounded_channel();
-            self.runtime.spawn(async move {
-                loop {
-                    tokio::select! {
-                        event = forward_rx.recv() => {
-                            let Some(event) = event else { break };
-                            if event_tx.send(event).is_err() {
-                                break;
-                            }
-                        }
-                        _ = event_tx.closed() => break,
-                    }
-                }
-            });
-            forward_tx
-        } else {
-            event_tx
-        };
-
         // Track if we need to start a timer (resource in Requested state)
         let mut start_timer_for: Option<String> = None;
         // Track newly-inserted cache entry for the resources gauge (None -> Requested).
