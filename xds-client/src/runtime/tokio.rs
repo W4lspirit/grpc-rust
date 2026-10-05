@@ -26,7 +26,7 @@
 
 use crate::runtime::Runtime;
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// Tokio-based runtime implementation.
 #[derive(Clone, Debug, Default)]
@@ -42,5 +42,31 @@ impl Runtime for TokioRuntime {
 
     async fn sleep(&self, duration: Duration) {
         tokio::time::sleep(duration).await;
+    }
+
+    fn now(&self) -> Instant {
+        tokio::time::Instant::now().into_std()
+    }
+
+    async fn sleep_until(&self, deadline: Instant) {
+        tokio::time::sleep_until(deadline.into()).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn delayed_poll_does_not_extend_deadline() {
+        let runtime = TokioRuntime;
+        for scheduling_delay in [3, 12] {
+            let deadline = runtime.now() + Duration::from_secs(10);
+            let sleep = runtime.sleep_until(deadline);
+            tokio::time::advance(Duration::from_secs(scheduling_delay)).await;
+            let resumed_at = runtime.now();
+            sleep.await;
+            assert_eq!(runtime.now(), deadline.max(resumed_at));
+        }
     }
 }

@@ -30,7 +30,7 @@ use std::task::{Context, Poll};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::client::worker::{WatchCommand, WatcherId, WorkerCommand};
+use crate::client::worker::{WatchEvent, WatcherId, WorkerCommand};
 use crate::error::Error;
 use crate::resource::{DecodedResource, Resource};
 
@@ -246,7 +246,7 @@ impl<T: Resource> Drop for ResourceWatcher<T> {
         // Unbounded sends cannot lose an unwatch command to a full queue.
         let _ = self
             .command_tx
-            .send(WorkerCommand::Command(WatchCommand::Unwatch {
+            .send(WorkerCommand::Watcher(WatchEvent::Unwatch {
                 watcher_id: self.watcher_id,
             }));
     }

@@ -34,7 +34,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot, watch};
@@ -518,13 +518,13 @@ struct WatcherEntry {
 /// Commands, timer expirations, and transport events are processed in enqueue
 /// order. Concurrent producers have no ordering guarantee before enqueueing.
 pub(crate) enum WorkerCommand {
-    Command(WatchCommand),
+    Watcher(WatchEvent),
     Transport(TransportEvent),
     TransportStopped,
 }
 
 /// Commands sent from `XdsClient` to the worker.
-pub(crate) enum WatchCommand {
+pub(crate) enum WatchEvent {
     /// Subscribe to a resource.
     Watch {
         /// The type URL of the resource.
@@ -567,7 +567,8 @@ pub(crate) enum TransportEvent {
         done: ProcessingDone,
     },
     Failed {
-        retry: oneshot::Sender<Option<Duration>>,
+        /// Absolute retry deadline; None means the retry policy is exhausted.
+        retry: oneshot::Sender<Option<Instant>>,
     },
 }
 
@@ -588,7 +589,7 @@ pub(crate) struct AdsWorker<C, R> {
     resource_initial_timeout: Option<Duration>,
     /// Weak sender for timer callback commands, so AdsWorker does not keep its own channel open.
     command_tx: mpsc::WeakUnboundedSender<WorkerCommand>,
-    /// Receiver for commands, timers, and transport events.
+    /// Receiver for watcher events (including resource timers) and transport events.
     command_rx: mpsc::UnboundedReceiver<WorkerCommand>,
     /// Per-type_url state.
     type_states: HashMap<String, TypeState>,
@@ -675,7 +676,7 @@ where
         // awaits inside a turn: a pending reconnect must not delay cached replay.
         while let Some(message) = self.command_rx.recv().await {
             let result = match message {
-                WorkerCommand::Command(cmd) => {
+                WorkerCommand::Watcher(cmd) => {
                     let sender = session
                         .as_ref()
                         .filter(|s| s.cancel.is_some())
@@ -737,7 +738,11 @@ where
                 } else {
                     self.record_unhealthy(healthy);
                 }
-                let _ = retry.send(self.backoff.next_backoff());
+                let deadline = self
+                    .backoff
+                    .next_backoff()
+                    .map(|delay| self.runtime.now() + delay);
+                let _ = retry.send(deadline);
                 Ok(())
             }
         }
@@ -800,10 +805,10 @@ where
     fn handle_command(
         &mut self,
         sender: Option<&mpsc::UnboundedSender<Bytes>>,
-        cmd: WatchCommand,
+        cmd: WatchEvent,
     ) -> Result<()> {
         match cmd {
-            WatchCommand::Watch {
+            WatchEvent::Watch {
                 type_url,
                 name,
                 watcher_id,
@@ -823,14 +828,14 @@ where
                     self.send_request(sender, type_url)?;
                 }
             }
-            WatchCommand::Unwatch { watcher_id } => {
+            WatchEvent::Unwatch { watcher_id } => {
                 if let Some((type_url, true)) = self.remove_watcher(watcher_id)
                     && let Some(sender) = sender
                 {
                     self.send_request(sender, &type_url)?;
                 }
             }
-            WatchCommand::ResourceTimerExpired { type_url, name } => {
+            WatchEvent::ResourceTimerExpired { type_url, name } => {
                 self.handle_resource_timeout(&type_url, &name);
             }
         }
@@ -1308,7 +1313,7 @@ where
                 _ = runtime.sleep(timeout) => {
                     let _ = send_worker_command(
                         &command_tx,
-                        WorkerCommand::Command(WatchCommand::ResourceTimerExpired {
+                        WorkerCommand::Watcher(WatchEvent::ResourceTimerExpired {
                             type_url: type_url_owned,
                             name,
                         }),
@@ -1438,11 +1443,12 @@ async fn run_transport<TB: TransportBuilder, R: Runtime>(
             return;
         }
         // The actor knows whether a response decoded successfully and owns the
-        // retry policy. Wait for its concrete delay, then perform the wait here.
-        let Ok(Some(delay)) = decision.await else {
+        // retry policy. Its absolute deadline includes time spent waiting to
+        // schedule this task after the decision, rather than adding that delay.
+        let Ok(Some(deadline)) = decision.await else {
             return;
         };
-        runtime.sleep(delay).await;
+        runtime.sleep_until(deadline).await;
     }
 }
 
@@ -1923,6 +1929,10 @@ mod tests {
             F: std::future::Future<Output = ()> + Send + 'static,
         {
             TokioRuntime.spawn(future);
+        }
+
+        fn now(&self) -> Instant {
+            TokioRuntime.now()
         }
 
         async fn sleep(&self, duration: Duration) {

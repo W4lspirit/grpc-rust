@@ -25,7 +25,7 @@
 //! Provides abstraction for async runtimes.
 
 use std::future::Future;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 #[cfg(feature = "rt-tokio")]
 pub mod tokio;
@@ -42,4 +42,18 @@ pub trait Runtime: Send + Sync + Clone + 'static {
 
     /// Sleep for the given duration.
     fn sleep(&self, duration: Duration) -> impl Future<Output = ()> + Send;
+
+    /// Read the monotonic clock used by this runtime's timers.
+    /// Runtimes with a virtual clock must override this method.
+    fn now(&self) -> Instant {
+        Instant::now()
+    }
+
+    /// Sleep until a deadline on this runtime's monotonic clock.
+    fn sleep_until(&self, deadline: Instant) -> impl Future<Output = ()> + Send {
+        async move {
+            self.sleep(deadline.saturating_duration_since(self.now()))
+                .await;
+        }
+    }
 }

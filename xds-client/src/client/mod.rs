@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 
 use crate::client::config::ClientConfig;
 use crate::client::watch::ResourceWatcher;
-use crate::client::worker::{AdsWorker, WatchCommand, WatcherId, WorkerCommand};
+use crate::client::worker::{AdsWorker, WatchEvent, WatcherId, WorkerCommand};
 use crate::codec::XdsCodec;
 use crate::metrics::MetricsRecorder;
 use crate::resource::{DecodedResource, DecoderFn, Resource};
@@ -212,7 +212,7 @@ impl XdsClient {
 
         let _ = self
             .command_tx
-            .send(WorkerCommand::Command(WatchCommand::Watch {
+            .send(WorkerCommand::Watcher(WatchEvent::Watch {
                 type_url: T::TYPE_URL.as_str(),
                 name,
                 watcher_id,
