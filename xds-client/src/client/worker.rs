@@ -664,7 +664,7 @@ where
         let runtime = self.runtime.clone();
         self.runtime.spawn(async move {
             tokio::select! {
-                _ = run_transport(builder, runtime, server, demand_rx, &command_tx) => {}
+                _ = Self::run_transport(builder, runtime, server, demand_rx, &command_tx) => {}
                 // Covers setup, backoff, I/O, and a held ProcessingDone token.
                 _ = shutdown_rx => {}
             }
@@ -1364,6 +1364,96 @@ where
             let _ = event_tx.send(event);
         }
     }
+
+    /// One long-lived lifecycle task. It owns transport handles and waits, but
+    /// never reads or mutates resource, subscription, version, or nonce state.
+    async fn run_transport<TB: TransportBuilder>(
+        builder: TB,
+        runtime: R,
+        server: ServerConfig,
+        mut demand: watch::Receiver<bool>,
+        command_tx: &mpsc::WeakUnboundedSender<WorkerCommand>,
+    ) {
+        loop {
+            // Do not connect without subscriptions. This latest-value signal is
+            // checked between attempts, so local changes never restart setup.
+            if demand.wait_for(|wanted| *wanted).await.is_err() {
+                return;
+            }
+            if let Ok(transport) = builder.build(&server).await
+                && let Ok((tx, rx)) = transport.new_stream().await
+            {
+                let (writes, write_rx) = mpsc::unbounded_channel();
+                let (cancel, cancelled) = oneshot::channel();
+                if send_worker_command(
+                    command_tx,
+                    WorkerCommand::Transport(TransportEvent::Ready { writes, cancel }),
+                )
+                .is_err()
+                {
+                    return;
+                }
+                // Read and write futures live only for this session. Cancelling one
+                // disposes of both; an old completion token cannot resume new I/O.
+                tokio::select! {
+                    _ = Self::run_stream::<TB::Transport>(tx, rx, write_rx, command_tx) => {}
+                    _ = cancelled => {}
+                }
+            }
+
+            let (retry, decision) = oneshot::channel();
+            if send_worker_command(
+                command_tx,
+                WorkerCommand::Transport(TransportEvent::Failed { retry }),
+            )
+            .is_err()
+            {
+                return;
+            }
+            // The actor knows whether a response decoded successfully and owns the
+            // retry policy. Its absolute deadline includes time spent waiting to
+            // schedule this task after the decision, rather than adding that delay.
+            let Ok(Some(deadline)) = decision.await else {
+                return;
+            };
+            runtime.sleep_until(deadline).await;
+        }
+    }
+
+    /// Concurrent stream I/O within the lifecycle task. ProcessingDone gates reads
+    /// only; writes keep running while watchers apply a response.
+    async fn run_stream<T: Transport>(
+        mut tx: T::Sender,
+        mut rx: T::Receiver,
+        mut writes: mpsc::UnboundedReceiver<Bytes>,
+        command_tx: &mpsc::WeakUnboundedSender<WorkerCommand>,
+    ) {
+        let write_loop = async {
+            while let Some(bytes) = writes.recv().await {
+                if tx.send(bytes).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let read_loop = async {
+            while let Ok(Some(bytes)) = rx.recv().await {
+                let (done, processed) = ProcessingDone::channel();
+                if send_worker_command(
+                    command_tx,
+                    WorkerCommand::Transport(TransportEvent::Response { bytes, done }),
+                )
+                .is_err()
+                {
+                    break;
+                }
+                let _ = processed.await;
+            }
+        };
+        tokio::select! {
+            _ = write_loop => {}
+            _ = read_loop => {}
+        }
+    }
 }
 
 /// Actor-owned state for the current stream. Keeping committed resource state
@@ -1395,96 +1485,6 @@ fn send_worker_command(
         .ok_or(Error::StreamClosed)?
         .send(message)
         .map_err(|_| Error::StreamClosed)
-}
-
-/// One long-lived lifecycle task. It owns transport handles and waits, but
-/// never reads or mutates resource, subscription, version, or nonce state.
-async fn run_transport<TB: TransportBuilder, R: Runtime>(
-    builder: TB,
-    runtime: R,
-    server: ServerConfig,
-    mut demand: watch::Receiver<bool>,
-    command_tx: &mpsc::WeakUnboundedSender<WorkerCommand>,
-) {
-    loop {
-        // Do not connect without subscriptions. This latest-value signal is
-        // checked between attempts, so local changes never restart setup.
-        if demand.wait_for(|wanted| *wanted).await.is_err() {
-            return;
-        }
-        if let Ok(transport) = builder.build(&server).await
-            && let Ok((tx, rx)) = transport.new_stream().await
-        {
-            let (writes, write_rx) = mpsc::unbounded_channel();
-            let (cancel, cancelled) = oneshot::channel();
-            if send_worker_command(
-                command_tx,
-                WorkerCommand::Transport(TransportEvent::Ready { writes, cancel }),
-            )
-            .is_err()
-            {
-                return;
-            }
-            // Read and write futures live only for this session. Cancelling one
-            // disposes of both; an old completion token cannot resume new I/O.
-            tokio::select! {
-                _ = run_stream::<TB::Transport>(tx, rx, write_rx, command_tx) => {}
-                _ = cancelled => {}
-            }
-        }
-
-        let (retry, decision) = oneshot::channel();
-        if send_worker_command(
-            command_tx,
-            WorkerCommand::Transport(TransportEvent::Failed { retry }),
-        )
-        .is_err()
-        {
-            return;
-        }
-        // The actor knows whether a response decoded successfully and owns the
-        // retry policy. Its absolute deadline includes time spent waiting to
-        // schedule this task after the decision, rather than adding that delay.
-        let Ok(Some(deadline)) = decision.await else {
-            return;
-        };
-        runtime.sleep_until(deadline).await;
-    }
-}
-
-/// Concurrent stream I/O within the lifecycle task. ProcessingDone gates reads
-/// only; writes keep running while watchers apply a response.
-async fn run_stream<T: Transport>(
-    mut tx: T::Sender,
-    mut rx: T::Receiver,
-    mut writes: mpsc::UnboundedReceiver<Bytes>,
-    command_tx: &mpsc::WeakUnboundedSender<WorkerCommand>,
-) {
-    let write_loop = async {
-        while let Some(bytes) = writes.recv().await {
-            if tx.send(bytes).await.is_err() {
-                break;
-            }
-        }
-    };
-    let read_loop = async {
-        while let Ok(Some(bytes)) = rx.recv().await {
-            let (done, processed) = ProcessingDone::channel();
-            if send_worker_command(
-                command_tx,
-                WorkerCommand::Transport(TransportEvent::Response { bytes, done }),
-            )
-            .is_err()
-            {
-                break;
-            }
-            let _ = processed.await;
-        }
-    };
-    tokio::select! {
-        _ = write_loop => {}
-        _ = read_loop => {}
-    }
 }
 
 #[cfg(test)]
