@@ -24,11 +24,13 @@
 
 //! ADS worker that manages the xDS stream.
 //!
-//! A state actor and a transport lifecycle task run independently, managing:
-//! - Connection, reconnection, and concurrent stream I/O in the lifecycle task
-//! - Resource subscriptions and version/nonce tracking
-//! - Dispatching resources to watchers
-//! - ACK/NACK protocol
+//! The worker processes watcher and transport events serially. It owns resource
+//! subscriptions, the cache, versions, nonces, and retry policy, and dispatches
+//! watcher notifications and ACK/NACK requests.
+//!
+//! A separate transport task connects, waits until retry deadlines, and reads
+//! and writes the ADS stream concurrently. Network waits and watcher processing
+//! do not block the worker from registering watchers or replaying cached resources.
 
 use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
@@ -523,7 +525,7 @@ pub(crate) enum WorkerCommand {
     TransportStopped,
 }
 
-/// Commands sent from `XdsClient` to the worker.
+/// Watcher registrations, cancellations, and resource timer expirations.
 pub(crate) enum WatchEvent {
     /// Subscribe to a resource.
     Watch {
@@ -672,8 +674,10 @@ where
         });
 
         let mut session: Option<ActiveSession> = None;
-        // Await only the next message here. Do not spawn state handlers or add
-        // awaits inside a turn: a pending reconnect must not delay cached replay.
+        // Process each event to completion before receiving the next one, so
+        // subscriptions and cached resources change in a defined order.
+        // Handlers enqueue requests and notifications without awaiting network
+        // I/O or watcher consumption.
         while let Some(message) = self.command_rx.recv().await {
             let result = match message {
                 WorkerCommand::Watcher(cmd) => {
