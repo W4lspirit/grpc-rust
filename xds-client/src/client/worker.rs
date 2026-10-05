@@ -1914,7 +1914,7 @@ mod tests {
 
     #[cfg(feature = "codegen-prost")]
     async fn cached_eds_during_reconnect(phase: ReconnectPhase) {
-        use envoy_types::pb::envoy::config::{core::v3 as core, endpoint::v3 as endpoint};
+        use envoy_types::pb::envoy::config::core::v3 as core;
         use envoy_types::pb::envoy::service::discovery::v3 as discovery;
         use envoy_types::pb::google::protobuf::{Any, UInt32Value};
         use prost::Message;
@@ -1941,56 +1941,30 @@ mod tests {
         gates.recv().await.unwrap().send(()).unwrap();
         let mut server = servers.recv().await.unwrap();
         server.requests.recv().await.unwrap();
-        let assignment = endpoint::ClusterLoadAssignment {
-            cluster_name: "cached-eds".into(),
-            endpoints: vec![endpoint::LocalityLbEndpoints {
-                locality: Some(core::Locality {
-                    region: "region".into(),
-                    zone: "zone".into(),
-                    sub_zone: "subzone".into(),
-                }),
-                load_balancing_weight: Some(UInt32Value { value: 7 }),
-                lb_endpoints: vec![endpoint::LbEndpoint {
-                    health_status: core::HealthStatus::Healthy as i32,
-                    load_balancing_weight: Some(UInt32Value { value: 3 }),
-                    host_identifier: Some(endpoint::lb_endpoint::HostIdentifier::Endpoint(
-                        endpoint::Endpoint {
-                            address: Some(core::Address {
-                                address: Some(core::address::Address::SocketAddress(
-                                    core::SocketAddress {
-                                        address: "127.0.0.1".into(),
-                                        port_specifier: Some(
-                                            core::socket_address::PortSpecifier::PortValue(8080),
-                                        ),
-                                        ..Default::default()
-                                    },
-                                )),
-                            }),
-                            ..Default::default()
-                        },
-                    )),
-                    ..Default::default()
-                }],
-                ..Default::default()
+        let mut assignment =
+            xds_test_util::config::build_cla("cached-eds", &[("127.0.0.1".into(), 8080)]);
+        let locality = &mut assignment.endpoints[0];
+        locality.locality = Some(core::Locality {
+            region: "region".into(),
+            zone: "zone".into(),
+            sub_zone: "subzone".into(),
+        });
+        locality.load_balancing_weight = Some(UInt32Value { value: 7 });
+        locality.lb_endpoints[0].health_status = core::HealthStatus::Healthy as i32;
+        locality.lb_endpoints[0].load_balancing_weight = Some(UInt32Value { value: 3 });
+        let mut response = discovery::DiscoveryResponse {
+            version_info: "accepted-version".into(),
+            nonce: "old-nonce".into(),
+            type_url: EdsResource::TYPE_URL.as_str().into(),
+            resources: vec![Any {
+                type_url: EdsResource::TYPE_URL.as_str().into(),
+                value: assignment.encode_to_vec(),
             }],
             ..Default::default()
         };
         server
             .responses
-            .send(Ok(Some(
-                discovery::DiscoveryResponse {
-                    version_info: "accepted-version".into(),
-                    nonce: "old-nonce".into(),
-                    type_url: EdsResource::TYPE_URL.as_str().into(),
-                    resources: vec![Any {
-                        type_url: EdsResource::TYPE_URL.as_str().into(),
-                        value: assignment.encode_to_vec(),
-                    }],
-                    ..Default::default()
-                }
-                .encode_to_vec()
-                .into(),
-            )))
+            .send(Ok(Some(response.encode_to_vec().into())))
             .unwrap();
         let (cached, done) = next_changed(&mut a).await;
         let cached = cached.unwrap();
@@ -2012,13 +1986,9 @@ mod tests {
         let replay_started = tokio::time::Instant::now();
         // A stays alive, so the last-watcher cache eviction cannot occur.
         let mut b = client.watch::<EdsResource>("cached-eds").await;
-        let event = tokio::time::timeout(Duration::from_millis(100), b.next())
+        let (result, done) = tokio::time::timeout(Duration::from_millis(100), next_changed(&mut b))
             .await
-            .expect("cached replay blocked on reconnect")
-            .unwrap();
-        let ResourceEvent::ResourceChanged { result, done } = event else {
-            panic!("expected cached assignment");
-        };
+            .expect("cached replay blocked on reconnect");
         let replayed = result.unwrap();
         assert_eq!(replayed.0, assignment);
         assert!(Arc::ptr_eq(&cached, &replayed));
@@ -2060,22 +2030,11 @@ mod tests {
         assert_eq!(initial.version_info, "accepted-version");
         assert!(initial.response_nonce.is_empty());
         // Neither the detached replay token nor old-session state blocks new reads.
+        response.version_info = "next-version".into();
+        response.nonce = "new-nonce".into();
         replacement
             .responses
-            .send(Ok(Some(
-                discovery::DiscoveryResponse {
-                    version_info: "next-version".into(),
-                    nonce: "new-nonce".into(),
-                    type_url: EdsResource::TYPE_URL.as_str().into(),
-                    resources: vec![Any {
-                        type_url: EdsResource::TYPE_URL.as_str().into(),
-                        value: assignment.encode_to_vec(),
-                    }],
-                    ..Default::default()
-                }
-                .encode_to_vec()
-                .into(),
-            )))
+            .send(Ok(Some(response.encode_to_vec().into())))
             .unwrap();
         let (updated, updated_done) = next_changed(&mut b).await;
         let updated = updated.unwrap();
