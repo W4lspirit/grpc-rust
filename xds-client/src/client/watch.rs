@@ -150,11 +150,11 @@ pub enum ResourceEvent<T> {
 #[derive(Debug)]
 pub struct ResourceWatcher<T: Resource> {
     /// Channel to receive events from the worker.
-    event_rx: mpsc::Receiver<ResourceEvent<DecodedResource>>,
+    event_rx: mpsc::UnboundedReceiver<ResourceEvent<DecodedResource>>,
     /// Unique identifier for this watcher.
     watcher_id: WatcherId,
     /// Channel to send commands to the worker (for unwatch on drop).
-    command_tx: mpsc::Sender<WorkerMessage>,
+    command_tx: mpsc::UnboundedSender<WorkerMessage>,
     /// Marker for the resource type.
     _marker: PhantomData<T>,
 }
@@ -162,9 +162,9 @@ pub struct ResourceWatcher<T: Resource> {
 impl<T: Resource> ResourceWatcher<T> {
     /// Create a new resource watcher.
     pub(crate) fn new(
-        event_rx: mpsc::Receiver<ResourceEvent<DecodedResource>>,
+        event_rx: mpsc::UnboundedReceiver<ResourceEvent<DecodedResource>>,
         watcher_id: WatcherId,
-        command_tx: mpsc::Sender<WorkerMessage>,
+        command_tx: mpsc::UnboundedSender<WorkerMessage>,
     ) -> Self {
         Self {
             event_rx,
@@ -243,11 +243,10 @@ impl<T: Resource> ResourceWatcher<T> {
 
 impl<T: Resource> Drop for ResourceWatcher<T> {
     fn drop(&mut self) {
-        // Best-effort: if the channel is full or closed, the worker will
-        // detect the closed event channel and clean up the watcher eventually.
+        // Unbounded sends cannot lose an unwatch command to a full queue.
         let _ = self
             .command_tx
-            .try_send(WorkerMessage::Command(WorkerCommand::Unwatch {
+            .send(WorkerMessage::Command(WorkerCommand::Unwatch {
                 watcher_id: self.watcher_id,
             }));
     }

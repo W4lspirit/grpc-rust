@@ -31,7 +31,7 @@
 //! - ACK/NACK protocol
 
 use std::collections::hash_map::Entry;
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
@@ -250,7 +250,7 @@ pub(crate) enum WorkerCommand {
         /// Unique identifier for this watcher.
         watcher_id: WatcherId,
         /// Channel to send resource events to the watcher.
-        event_tx: mpsc::Sender<ResourceEvent<DecodedResource>>,
+        event_tx: mpsc::UnboundedSender<ResourceEvent<DecodedResource>>,
         /// Decoder function for this resource type.
         decoder: DecoderFn,
         /// Whether all resources must be present in SotW responses (per A53).
@@ -485,7 +485,10 @@ impl TypeState {
     }
 
     /// Get senders for all watchers interested in a specific resource.
-    fn matching_watchers(&self, name: &str) -> Vec<mpsc::Sender<ResourceEvent<DecodedResource>>> {
+    fn matching_watchers(
+        &self,
+        name: &str,
+    ) -> Vec<mpsc::UnboundedSender<ResourceEvent<DecodedResource>>> {
         self.watchers
             .values()
             .filter(|e| e.subscription.matches(name))
@@ -543,7 +546,7 @@ impl WatcherSubscription {
 #[derive(Debug)]
 struct WatcherEntry {
     /// Channel to send events to this watcher.
-    event_tx: mpsc::Sender<ResourceEvent<DecodedResource>>,
+    event_tx: mpsc::UnboundedSender<ResourceEvent<DecodedResource>>,
     /// What resources this watcher is subscribed to.
     subscription: WatcherSubscription,
 }
@@ -566,9 +569,9 @@ pub(crate) struct AdsWorker<TB, C, R> {
     /// Timeout for initial resource response (gRFC A57). None = disabled.
     resource_initial_timeout: Option<Duration>,
     /// Weak sender for timer callback commands, so AdsWorker does not keep its own channel open.
-    command_tx: mpsc::WeakSender<WorkerMessage>,
+    command_tx: mpsc::WeakUnboundedSender<WorkerMessage>,
     /// Receiver for commands from XdsClient.
-    command_rx: mpsc::Receiver<WorkerMessage>,
+    command_rx: mpsc::UnboundedReceiver<WorkerMessage>,
     /// Per-type_url state.
     type_states: HashMap<String, TypeState>,
     /// Cancellation handles for resource timers (gRFC A57).
@@ -602,8 +605,8 @@ where
         codec: C,
         runtime: R,
         config: ClientConfig,
-        command_tx: mpsc::Sender<WorkerMessage>,
-        command_rx: mpsc::Receiver<WorkerMessage>,
+        command_tx: mpsc::UnboundedSender<WorkerMessage>,
+        command_rx: mpsc::UnboundedReceiver<WorkerMessage>,
         recorder: Option<Arc<dyn MetricsRecorder>>,
     ) -> Self {
         let target: Arc<str> = Arc::from(config.target.unwrap_or_default());
@@ -908,7 +911,7 @@ where
         type_url: &'static str,
         name: String,
         watcher_id: WatcherId,
-        event_tx: mpsc::Sender<ResourceEvent<DecodedResource>>,
+        event_tx: mpsc::UnboundedSender<ResourceEvent<DecodedResource>>,
         decoder: DecoderFn,
         all_resources_required_in_sotw: bool,
     ) -> bool {
@@ -923,46 +926,25 @@ where
         let old_subscription = type_state.subscription.clone();
         let watcher_subscription = WatcherSubscription::from_name(name.clone());
 
-        // Wildcard subscriptions can receive an unbounded number of resources
-        // in a single SotW response. Spawn a task that drains the worker's
-        // bounded channel into an unbounded queue and forwards events to the
-        // watcher's bounded channel, so the worker never blocks waiting for the
-        // watcher to drain.
+        // Keep wildcard forwarding separate for now. The unbounded channel
+        // buffers a whole response without blocking the actor. A follow-up can
+        // batch notifications per response instead of forwarding each resource.
         let event_tx = if watcher_subscription.is_wildcard() {
-            // Channel has arbitrary size
-            let (worker_tx, mut worker_rx) = mpsc::channel(128);
+            let (forward_tx, mut forward_rx) = mpsc::unbounded_channel();
             self.runtime.spawn(async move {
-                let mut queue = VecDeque::new();
                 loop {
                     tokio::select! {
-                        event = worker_rx.recv() => {
-                            match event {
-                                Some(event) => queue.push_back(event),
-                                None => {
-                                    while let Some(event) = queue.pop_front() {
-                                        if event_tx.send(event).await.is_err() {
-                                            break;
-                                        }
-                                    }
-                                    break;
-                                }
+                        event = forward_rx.recv() => {
+                            let Some(event) = event else { break };
+                            if event_tx.send(event).is_err() {
+                                break;
                             }
                         }
-                        res = event_tx.reserve(), if !queue.is_empty() => {
-                            match res {
-                                Ok(permit) => {
-                                    if let Some(event) = queue.pop_front() {
-                                        permit.send(event);
-                                    }
-                                }
-                                Err(_) => break,
-                            }
-                        }
-                        _ = event_tx.closed(), if queue.is_empty() => break,
+                        _ = event_tx.closed() => break,
                     }
                 }
             });
-            worker_tx
+            forward_tx
         } else {
             event_tx
         };
@@ -984,8 +966,8 @@ where
             };
 
             if let Some(event) = cached.to_event() {
-                // Send cached state to watcher (non-blocking, ignore if full)
-                let _ = event_tx.try_send(event);
+                // Enqueue cached state without waiting for the watcher.
+                let _ = event_tx.send(event);
             }
 
             if cached.is_requested() {
@@ -1237,7 +1219,7 @@ where
                         result: Ok(Arc::clone(&resource)),
                         done: done.share(),
                     };
-                    let _ = event_tx.send(event).await;
+                    let _ = event_tx.send(event);
                 }
             }
         }
@@ -1276,7 +1258,7 @@ where
                 result: Err(Error::Validation(error.to_string())),
                 done: done.share(),
             };
-            let _ = event_tx.send(event).await;
+            let _ = event_tx.send(event);
         }
     }
 
@@ -1320,7 +1302,7 @@ where
                     result: Err(Error::ResourceDoesNotExist),
                     done: done.share(),
                 };
-                let _ = event_tx.send(event).await;
+                let _ = event_tx.send(event);
             }
         }
 
@@ -1413,7 +1395,7 @@ where
                         let _ = command_tx.send(WorkerMessage::Command(WorkerCommand::ResourceTimerExpired {
                             type_url: type_url_owned,
                             name,
-                        })).await;
+                        }));
                     }
                 }
                 _ = cancel_rx => {}
@@ -1458,7 +1440,7 @@ where
                 result: Err(Error::ResourceDoesNotExist),
                 done: ProcessingDone::detached(),
             };
-            let _ = event_tx.send(event).await;
+            let _ = event_tx.send(event);
         }
     }
 }

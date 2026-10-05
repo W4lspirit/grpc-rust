@@ -114,7 +114,7 @@ where
     /// This spawns a background task that manages the ADS stream.
     /// The task runs until all `XdsClient` handles are dropped.
     pub fn build(self) -> XdsClient {
-        let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL_BUFFER_SIZE);
+        let (command_tx, command_rx) = mpsc::unbounded_channel();
 
         let worker = AdsWorker::new(
             self.transport_builder,
@@ -143,20 +143,8 @@ where
 #[derive(Clone, Debug)]
 pub struct XdsClient {
     /// Channel to send commands to the worker.
-    command_tx: mpsc::Sender<WorkerMessage>,
+    command_tx: mpsc::UnboundedSender<WorkerMessage>,
 }
-
-/// Buffer size for the command channel between [`XdsClient`] handles and the worker.
-///
-/// Commands are lightweight (watch/unwatch/timer), so a modest buffer suffices.
-/// The channel provides backpressure if the worker is temporarily busy processing
-/// a response.
-const COMMAND_CHANNEL_BUFFER_SIZE: usize = 64;
-
-/// Default buffer size for watcher event channels.
-///
-/// This provides backpressure when watchers are slow to process events.
-const WATCHER_CHANNEL_BUFFER_SIZE: usize = 16;
 
 impl XdsClient {
     /// Create a new builder with the given configuration, transport builder, codec, and runtime.
@@ -206,7 +194,7 @@ impl XdsClient {
     pub async fn watch<T: Resource>(&self, name: impl Into<String>) -> ResourceWatcher<T> {
         let name = name.into();
         let watcher_id = WatcherId::new();
-        let (event_tx, event_rx) = mpsc::channel(WATCHER_CHANNEL_BUFFER_SIZE);
+        let (event_tx, event_rx) = mpsc::unbounded_channel();
 
         let decoder: DecoderFn = Box::new(|bytes| match crate::resource::decode::<T>(bytes) {
             crate::resource::DecodeResult::Success { name, resource } => {
@@ -232,8 +220,7 @@ impl XdsClient {
                 event_tx,
                 decoder,
                 all_resources_required_in_sotw: T::ALL_RESOURCES_REQUIRED_IN_SOTW,
-            }))
-            .await;
+            }));
 
         ResourceWatcher::new(event_rx, watcher_id, self.command_tx.clone())
     }
@@ -246,7 +233,7 @@ impl XdsClient {
     /// Requires the `test-util` feature.
     #[cfg(feature = "test-util")]
     pub fn disconnected() -> Self {
-        let (tx, _rx) = mpsc::channel(1);
+        let (tx, _rx) = mpsc::unbounded_channel();
         Self { command_tx: tx }
     }
 }
