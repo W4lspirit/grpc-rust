@@ -649,7 +649,7 @@ where
             while self.type_states.is_empty() {
                 match self.command_rx.recv().await {
                     Some(WorkerMessage::Command(cmd)) => {
-                        let _ = self.handle_command(None, cmd).await;
+                        let _ = self.handle_command(None, cmd);
                     }
                     None => break 'outer,
                 }
@@ -798,7 +798,7 @@ where
                             };
                             saw_response = true;
                             self.record_healthy(healthy);
-                            if self.handle_response(&write_tx, response, done).await.is_err() {
+                            if self.handle_response(&write_tx, response, done).is_err() {
                                 // All errors are related to sending a request, not `response` whose
                                 // problems are handled by notifying the server.
                                 return ConnectedOutcome::Failed { saw_response };
@@ -810,7 +810,7 @@ where
                 cmd = self.command_rx.recv() => {
                     match cmd {
                         Some(WorkerMessage::Command(cmd)) => {
-                            if self.handle_command(Some(&write_tx), cmd).await.is_err() {
+                            if self.handle_command(Some(&write_tx), cmd).is_err() {
                                 return ConnectedOutcome::Failed { saw_response };
                             }
                         }
@@ -862,7 +862,7 @@ where
     /// When `sender` is `None`, only state updates are performed (disconnected mode).
     /// When `sender` is `Some`, subscription changes trigger network requests via
     /// the unbounded write channel.
-    async fn handle_command(
+    fn handle_command(
         &mut self,
         sender: Option<&mpsc::UnboundedSender<Bytes>>,
         cmd: WorkerCommand,
@@ -896,7 +896,7 @@ where
                 }
             }
             WorkerCommand::ResourceTimerExpired { type_url, name } => {
-                self.handle_resource_timeout(&type_url, &name).await;
+                self.handle_resource_timeout(&type_url, &name);
             }
         }
         Ok(())
@@ -1073,7 +1073,7 @@ where
     /// one response is in flight at a time, and wildcard watches buffer events
     /// in an unbounded queue, so sending notifications directly cannot fill
     /// a watcher channel or deadlock.
-    async fn handle_response(
+    fn handle_response(
         &mut self,
         sender: &mpsc::UnboundedSender<Bytes>,
         response: DiscoveryResponse,
@@ -1127,21 +1127,18 @@ where
             .map(|r| r.name().to_string())
             .collect();
 
-        self.dispatch_resources(&type_url, valid_resources, &done)
-            .await;
+        self.dispatch_resources(&type_url, valid_resources, &done);
 
         // Only notify watchers for per-resource errors (where we know the name).
         // Top-level errors have no associated name, so no watcher to notify.
         for (resource_name, error) in &per_resource_errors {
-            self.notify_resource_error(&type_url, resource_name, error, &done)
-                .await;
+            self.notify_resource_error(&type_url, resource_name, error, &done);
         }
 
         // Detect deleted resources (per A53):
         // For resource types with ALL_RESOURCES_REQUIRED_IN_SOTW = true,
         // any previously-received resource not in this response is deleted.
-        self.detect_deleted_resources(&type_url, &received_names, &done)
-            .await;
+        self.detect_deleted_resources(&type_url, &received_names, &done);
 
         let has_errors = !top_level_errors.is_empty() || !per_resource_errors.is_empty();
         if !has_errors {
@@ -1178,7 +1175,7 @@ where
     ///
     /// Delivered events share the response's `ProcessingDone` signal, which
     /// gates reading the next response (ADS flow control).
-    async fn dispatch_resources(
+    fn dispatch_resources(
         &mut self,
         type_url: &str,
         resources: Vec<DecodedResource>,
@@ -1229,7 +1226,7 @@ where
     ///
     /// Per gRFC A46/A88, errors are routed only to watchers interested in
     /// that specific resource (plus wildcard watchers).
-    async fn notify_resource_error(
+    fn notify_resource_error(
         &mut self,
         type_url: &str,
         resource_name: &str,
@@ -1268,7 +1265,7 @@ where
     /// Per gRFC A53, for resource types with ALL_RESOURCES_REQUIRED_IN_SOTW = true,
     /// if a previously-received resource is absent from a new SotW response,
     /// it is treated as deleted.
-    async fn detect_deleted_resources(
+    fn detect_deleted_resources(
         &mut self,
         type_url: &str,
         received_names: &HashSet<String>,
@@ -1409,7 +1406,7 @@ where
     ///
     /// If the resource is still in Requested state, marks it as DoesNotExist
     /// and notifies all watchers interested in this resource.
-    async fn handle_resource_timeout(&mut self, type_url: &str, name: &str) {
+    fn handle_resource_timeout(&mut self, type_url: &str, name: &str) {
         self.resource_timers
             .remove(&(type_url.to_string(), name.to_string()));
 
