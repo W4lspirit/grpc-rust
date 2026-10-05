@@ -270,6 +270,11 @@ pub(crate) enum WorkerCommand {
     },
 }
 
+/// Messages delivered to the ADS worker through the command channel.
+pub(crate) enum WorkerMessage {
+    Command(WorkerCommand),
+}
+
 /// Represents the subscription mode for a resource type.
 ///
 /// This enum captures the mutually exclusive subscription states:
@@ -561,9 +566,9 @@ pub(crate) struct AdsWorker<TB, C, R> {
     /// Timeout for initial resource response (gRFC A57). None = disabled.
     resource_initial_timeout: Option<Duration>,
     /// Weak sender for timer callback commands, so AdsWorker does not keep its own channel open.
-    command_tx: mpsc::WeakSender<WorkerCommand>,
+    command_tx: mpsc::WeakSender<WorkerMessage>,
     /// Receiver for commands from XdsClient.
-    command_rx: mpsc::Receiver<WorkerCommand>,
+    command_rx: mpsc::Receiver<WorkerMessage>,
     /// Per-type_url state.
     type_states: HashMap<String, TypeState>,
     /// Cancellation handles for resource timers (gRFC A57).
@@ -597,8 +602,8 @@ where
         codec: C,
         runtime: R,
         config: ClientConfig,
-        command_tx: mpsc::Sender<WorkerCommand>,
-        command_rx: mpsc::Receiver<WorkerCommand>,
+        command_tx: mpsc::Sender<WorkerMessage>,
+        command_rx: mpsc::Receiver<WorkerMessage>,
         recorder: Option<Arc<dyn MetricsRecorder>>,
     ) -> Self {
         let target: Arc<str> = Arc::from(config.target.unwrap_or_default());
@@ -640,7 +645,7 @@ where
             // sending response headers - we need something to send.
             while self.type_states.is_empty() {
                 match self.command_rx.recv().await {
-                    Some(cmd) => {
+                    Some(WorkerMessage::Command(cmd)) => {
                         let _ = self.handle_command(None, cmd).await;
                     }
                     None => break 'outer,
@@ -801,7 +806,7 @@ where
                 }
                 cmd = self.command_rx.recv() => {
                     match cmd {
-                        Some(cmd) => {
+                        Some(WorkerMessage::Command(cmd)) => {
                             if self.handle_command(Some(&write_tx), cmd).await.is_err() {
                                 return ConnectedOutcome::Failed { saw_response };
                             }
@@ -1405,10 +1410,10 @@ where
             tokio::select! {
                 _ = runtime.sleep(timeout) => {
                     if let Some(command_tx) = command_tx.upgrade() {
-                        let _ = command_tx.send(WorkerCommand::ResourceTimerExpired {
+                        let _ = command_tx.send(WorkerMessage::Command(WorkerCommand::ResourceTimerExpired {
                             type_url: type_url_owned,
                             name,
-                        }).await;
+                        })).await;
                     }
                 }
                 _ = cancel_rx => {}

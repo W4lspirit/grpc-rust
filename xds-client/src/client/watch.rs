@@ -30,7 +30,7 @@ use std::task::{Context, Poll};
 
 use tokio::sync::{mpsc, oneshot};
 
-use crate::client::worker::{WatcherId, WorkerCommand};
+use crate::client::worker::{WatcherId, WorkerCommand, WorkerMessage};
 use crate::error::Error;
 use crate::resource::{DecodedResource, Resource};
 
@@ -154,7 +154,7 @@ pub struct ResourceWatcher<T: Resource> {
     /// Unique identifier for this watcher.
     watcher_id: WatcherId,
     /// Channel to send commands to the worker (for unwatch on drop).
-    command_tx: mpsc::Sender<WorkerCommand>,
+    command_tx: mpsc::Sender<WorkerMessage>,
     /// Marker for the resource type.
     _marker: PhantomData<T>,
 }
@@ -164,7 +164,7 @@ impl<T: Resource> ResourceWatcher<T> {
     pub(crate) fn new(
         event_rx: mpsc::Receiver<ResourceEvent<DecodedResource>>,
         watcher_id: WatcherId,
-        command_tx: mpsc::Sender<WorkerCommand>,
+        command_tx: mpsc::Sender<WorkerMessage>,
     ) -> Self {
         Self {
             event_rx,
@@ -245,8 +245,10 @@ impl<T: Resource> Drop for ResourceWatcher<T> {
     fn drop(&mut self) {
         // Best-effort: if the channel is full or closed, the worker will
         // detect the closed event channel and clean up the watcher eventually.
-        let _ = self.command_tx.try_send(WorkerCommand::Unwatch {
-            watcher_id: self.watcher_id,
-        });
+        let _ = self
+            .command_tx
+            .try_send(WorkerMessage::Command(WorkerCommand::Unwatch {
+                watcher_id: self.watcher_id,
+            }));
     }
 }

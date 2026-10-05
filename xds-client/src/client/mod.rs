@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 
 use crate::client::config::ClientConfig;
 use crate::client::watch::ResourceWatcher;
-use crate::client::worker::{AdsWorker, WatcherId, WorkerCommand};
+use crate::client::worker::{AdsWorker, WatcherId, WorkerCommand, WorkerMessage};
 use crate::codec::XdsCodec;
 use crate::metrics::MetricsRecorder;
 use crate::resource::{DecodedResource, DecoderFn, Resource};
@@ -143,7 +143,7 @@ where
 #[derive(Clone, Debug)]
 pub struct XdsClient {
     /// Channel to send commands to the worker.
-    command_tx: mpsc::Sender<WorkerCommand>,
+    command_tx: mpsc::Sender<WorkerMessage>,
 }
 
 /// Buffer size for the command channel between [`XdsClient`] handles and the worker.
@@ -225,14 +225,14 @@ impl XdsClient {
 
         let _ = self
             .command_tx
-            .send(WorkerCommand::Watch {
+            .send(WorkerMessage::Command(WorkerCommand::Watch {
                 type_url: T::TYPE_URL.as_str(),
                 name,
                 watcher_id,
                 event_tx,
                 decoder,
                 all_resources_required_in_sotw: T::ALL_RESOURCES_REQUIRED_IN_SOTW,
-            })
+            }))
             .await;
 
         ResourceWatcher::new(event_rx, watcher_id, self.command_tx.clone())
