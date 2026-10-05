@@ -112,12 +112,11 @@ where
     /// Build the client and start the background worker.
     ///
     /// This spawns a background task that manages the ADS stream.
-    /// The task runs until all `XdsClient` handles are dropped.
+    /// The task runs until all client handles and watchers are dropped.
     pub fn build(self) -> XdsClient {
         let (command_tx, command_rx) = mpsc::unbounded_channel();
 
         let worker = AdsWorker::new(
-            self.transport_builder,
             self.codec,
             self.runtime.clone(),
             self.config,
@@ -127,7 +126,7 @@ where
         );
 
         self.runtime.spawn(async move {
-            worker.run().await;
+            worker.run(self.transport_builder).await;
         });
 
         XdsClient { command_tx }
@@ -139,7 +138,7 @@ where
 /// This is a handle to the background worker that manages the ADS stream.
 /// Cloning this handle creates a new reference to the same worker.
 ///
-/// When all `XdsClient` handles are dropped, the background worker shuts down.
+/// When all client handles and watchers are dropped, the background worker shuts down.
 #[derive(Clone, Debug)]
 pub struct XdsClient {
     /// Channel to send commands to the worker.

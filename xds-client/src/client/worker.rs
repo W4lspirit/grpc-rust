@@ -24,8 +24,8 @@
 
 //! ADS worker that manages the xDS stream.
 //!
-//! The worker runs as a background task, managing:
-//! - The ADS stream lifecycle (connection, reconnection)
+//! A state actor and a transport lifecycle task run independently, managing:
+//! - Connection, reconnection, and concurrent stream I/O in the lifecycle task
 //! - Resource subscriptions and version/nonce tracking
 //! - Dispatching resources to watchers
 //! - ACK/NACK protocol
@@ -37,7 +37,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::client::config::{ClientConfig, ServerConfig};
 use crate::client::retry::Backoff;
@@ -237,42 +237,6 @@ impl Default for WatcherId {
     fn default() -> Self {
         Self::new()
     }
-}
-
-/// Commands sent from `XdsClient` to the worker.
-pub(crate) enum WorkerCommand {
-    /// Subscribe to a resource.
-    Watch {
-        /// The type URL of the resource.
-        type_url: &'static str,
-        /// The resource name (empty string for wildcard subscription).
-        name: String,
-        /// Unique identifier for this watcher.
-        watcher_id: WatcherId,
-        /// Channel to send resource events to the watcher.
-        event_tx: mpsc::UnboundedSender<ResourceEvent<DecodedResource>>,
-        /// Decoder function for this resource type.
-        decoder: DecoderFn,
-        /// Whether all resources must be present in SotW responses (per A53).
-        all_resources_required_in_sotw: bool,
-    },
-    /// Unsubscribe a watcher.
-    Unwatch {
-        /// The watcher to remove.
-        watcher_id: WatcherId,
-    },
-    /// Timer expired for a resource that was never received (gRFC A57).
-    ResourceTimerExpired {
-        /// The type URL of the resource.
-        type_url: String,
-        /// The resource name.
-        name: String,
-    },
-}
-
-/// Messages delivered to the ADS worker through the command channel.
-pub(crate) enum WorkerMessage {
-    Command(WorkerCommand),
 }
 
 /// Represents the subscription mode for a resource type.
@@ -488,12 +452,11 @@ impl TypeState {
     fn matching_watchers(
         &self,
         name: &str,
-    ) -> Vec<mpsc::UnboundedSender<ResourceEvent<DecodedResource>>> {
+    ) -> impl Iterator<Item = &mpsc::UnboundedSender<ResourceEvent<DecodedResource>>> {
         self.watchers
             .values()
-            .filter(|e| e.subscription.matches(name))
-            .map(|e| e.event_tx.clone())
-            .collect()
+            .filter(move |e| e.subscription.matches(name))
+            .map(|e| &e.event_tx)
     }
 
     /// Current number of cached resources in each `grpc.xds.cache_state`, keyed
@@ -551,10 +514,65 @@ struct WatcherEntry {
     subscription: WatcherSubscription,
 }
 
+/// All inputs to the state actor share one FIFO message queue.
+/// Commands, timer expirations, and transport events are processed in enqueue
+/// order. Concurrent producers have no ordering guarantee before enqueueing.
+pub(crate) enum WorkerMessage {
+    Command(WorkerCommand),
+    Transport(TransportEvent),
+    TransportStopped,
+}
+
+/// Commands sent from `XdsClient` to the worker.
+pub(crate) enum WorkerCommand {
+    /// Subscribe to a resource.
+    Watch {
+        /// The type URL of the resource.
+        type_url: &'static str,
+        /// The resource name (empty string for wildcard subscription).
+        name: String,
+        /// Unique identifier for this watcher.
+        watcher_id: WatcherId,
+        /// Channel to send resource events to the watcher.
+        event_tx: mpsc::UnboundedSender<ResourceEvent<DecodedResource>>,
+        /// Decoder function for this resource type.
+        decoder: DecoderFn,
+        /// Whether all resources must be present in SotW responses (per A53).
+        all_resources_required_in_sotw: bool,
+    },
+    /// Unsubscribe a watcher.
+    Unwatch {
+        /// The watcher to remove.
+        watcher_id: WatcherId,
+    },
+    /// Timer expired for a resource that was never received (gRFC A57).
+    ResourceTimerExpired {
+        /// The type URL of the resource.
+        type_url: String,
+        /// The resource name.
+        name: String,
+    },
+}
+
+/// Events from the transport lifecycle, in Ready -> Response* -> Failed order.
+/// The lifecycle waits for the actor's retry decision before starting another
+/// session, so events from different sessions cannot interleave.
+pub(crate) enum TransportEvent {
+    Ready {
+        writes: mpsc::UnboundedSender<Bytes>,
+        cancel: oneshot::Sender<()>,
+    },
+    Response {
+        bytes: Bytes,
+        done: ProcessingDone,
+    },
+    Failed {
+        retry: oneshot::Sender<Option<Duration>>,
+    },
+}
+
 /// The ADS worker manages the xDS stream and dispatches resources to watchers.
-pub(crate) struct AdsWorker<TB, C, R> {
-    /// Transport builder for creating transports to xDS servers.
-    transport_builder: TB,
+pub(crate) struct AdsWorker<C, R> {
     /// Codec for encoding/decoding messages.
     codec: C,
     /// Runtime for spawning tasks and sleeping.
@@ -570,7 +588,7 @@ pub(crate) struct AdsWorker<TB, C, R> {
     resource_initial_timeout: Option<Duration>,
     /// Weak sender for timer callback commands, so AdsWorker does not keep its own channel open.
     command_tx: mpsc::WeakUnboundedSender<WorkerMessage>,
-    /// Receiver for commands from XdsClient.
+    /// Receiver for commands, timers, and transport events.
     command_rx: mpsc::UnboundedReceiver<WorkerMessage>,
     /// Per-type_url state.
     type_states: HashMap<String, TypeState>,
@@ -582,26 +600,13 @@ pub(crate) struct AdsWorker<TB, C, R> {
     recorder: RecorderHandle,
 }
 
-/// Outcome of a connected ADS session (see [`AdsWorker::run_connected`]).
-enum ConnectedOutcome {
-    /// All `XdsClient` handles were dropped; the worker should shut down.
-    Shutdown,
-    /// The ADS stream failed; the worker should reconnect. `saw_response`
-    /// indicates whether at least one response was received before the failure
-    /// — per gRFC A78, a stream that fails after a response is not counted as a
-    /// server failure.
-    Failed { saw_response: bool },
-}
-
-impl<TB, C, R> AdsWorker<TB, C, R>
+impl<C, R> AdsWorker<C, R>
 where
-    TB: TransportBuilder,
     C: XdsCodec,
     R: Runtime,
 {
     /// Create a new worker.
     pub(crate) fn new(
-        transport_builder: TB,
         codec: C,
         runtime: R,
         config: ClientConfig,
@@ -611,7 +616,6 @@ where
     ) -> Self {
         let target: Arc<str> = Arc::from(config.target.unwrap_or_default());
         Self {
-            transport_builder,
             codec,
             runtime,
             node: config.node,
@@ -628,9 +632,18 @@ where
 
     /// Run the worker event loop.
     ///
-    /// This method runs until all `XdsClient` handles are dropped
+    /// This method runs until all client handles and watchers are dropped
     /// (which closes the command channel).
-    pub(crate) async fn run(mut self) {
+    ///
+    /// Serialization contract: this task alone mutates subscriptions, cached
+    /// resources, versions, nonces, and retry policy. Each message is handled to
+    /// completion before the next message is received, including any stream
+    /// cancellation caused by that message.
+    ///
+    /// Handlers must stay synchronous and must not block on network operations,
+    /// watcher consumption, or ProcessingDone. They enqueue writes and watcher
+    /// events; the transport task performs connection, retry, and I/O waits.
+    pub(crate) async fn run<TB: TransportBuilder>(mut self, builder: TB) {
         // Future extension (gRFC A71): Try servers in priority order with fallback.
         let server = match self.servers.first() {
             Some(s) => s.clone(),
@@ -642,71 +655,91 @@ where
         // "For a given server, set to 1 when the stream is initially created."
         let mut healthy = true;
         self.recorder.record_connected(true);
-        'outer: loop {
-            // Wait for at least one subscription before connecting.
-            // This prevents deadlock with servers that require a message before
-            // sending response headers - we need something to send.
-            while self.type_states.is_empty() {
-                match self.command_rx.recv().await {
-                    Some(WorkerMessage::Command(cmd)) => {
-                        let _ = self.handle_command(None, cmd);
-                    }
-                    None => break 'outer,
-                }
+        // Only subscription presence crosses this boundary, never a copy of
+        // resource names or protocol state. Changes do not restart setup.
+        let (demand_tx, demand_rx) = watch::channel(false);
+        let (_shutdown, shutdown_rx) = oneshot::channel::<()>();
+        let command_tx = self.command_tx.clone();
+        let runtime = self.runtime.clone();
+        self.runtime.spawn(async move {
+            tokio::select! {
+                _ = run_transport(builder, runtime, server, demand_rx, &command_tx) => {}
+                // Covers setup, backoff, I/O, and a held ProcessingDone token.
+                _ = shutdown_rx => {}
             }
+            let _ = send_worker_message(&command_tx, WorkerMessage::TransportStopped);
+        });
 
-            // Nonces are tied to the stream
-            for type_state in self.type_states.values_mut() {
-                type_state.nonce.clear();
-            }
-
-            // Connect to server.
-            let transport = match self.transport_builder.build(&server).await {
-                Ok(t) => t,
-                Err(_) => {
-                    self.record_unhealthy(&mut healthy);
-                    match self.backoff.next_backoff() {
-                        Some(backoff) => self.runtime.sleep(backoff).await,
-                        None => break, // Max attempts exceeded
-                    }
-                    continue;
+        let mut session: Option<ActiveSession> = None;
+        // Await only the next message here. Do not spawn state handlers or add
+        // awaits inside a turn: a pending reconnect must not delay cached replay.
+        while let Some(message) = self.command_rx.recv().await {
+            let result = match message {
+                WorkerMessage::Command(cmd) => {
+                    let sender = session
+                        .as_ref()
+                        .filter(|s| s.cancel.is_some())
+                        .map(|s| &s.writes);
+                    let result = self.handle_command(sender, cmd);
+                    demand_tx.send_replace(!self.type_states.is_empty());
+                    result
                 }
+                WorkerMessage::Transport(event) => {
+                    self.handle_transport_event(event, &mut session, &mut healthy)
+                }
+                WorkerMessage::TransportStopped => break,
             };
-
-            let (tx, rx) = match transport.new_stream().await {
-                Ok(s) => s,
-                Err(_) => {
-                    self.record_unhealthy(&mut healthy);
-                    match self.backoff.next_backoff() {
-                        Some(backoff) => self.runtime.sleep(backoff).await,
-                        None => break, // Max attempts exceeded
-                    }
-                    continue;
-                }
-            };
-
-            match self.run_connected(tx, rx, &mut healthy).await {
-                ConnectedOutcome::Shutdown => break,
-                ConnectedOutcome::Failed { saw_response } => {
-                    // gRFC A78: a server goes unhealthy (one `server_failure`) on
-                    // a connectivity failure or when the ADS stream fails
-                    // *without* seeing a response message. A stream that failed
-                    // after receiving a response is not counted; just reconnect.
-                    if saw_response {
-                        self.backoff.reset();
-                    } else {
-                        self.record_unhealthy(&mut healthy);
-                    }
-                    match self.backoff.next_backoff() {
-                        Some(backoff) => self.runtime.sleep(backoff).await,
-                        None => break, // Max attempts exceeded
-                    }
-                    continue;
-                }
+            // Every protocol or write failure retires the stream the same way.
+            if result.is_err()
+                && let Some(active) = &mut session
+            {
+                drop(active.cancel.take());
             }
         }
         if healthy {
             self.recorder.record_connected(false);
+        }
+    }
+
+    /// Apply a lifecycle event without waiting on transport I/O.
+    fn handle_transport_event(
+        &mut self,
+        event: TransportEvent,
+        session: &mut Option<ActiveSession>,
+        healthy: &mut bool,
+    ) -> Result<()> {
+        match event {
+            TransportEvent::Ready { writes, cancel } => {
+                for state in self.type_states.values_mut() {
+                    state.nonce.clear();
+                }
+                let active = ActiveSession::new(writes, cancel);
+                // Reconcile subscriptions from current actor state after setup.
+                let result = self.send_initial_requests(&active.writes);
+                *session = Some(active);
+                result
+            }
+            TransportEvent::Response { bytes, done } => {
+                let Some(active) = session.as_mut().filter(|s| s.cancel.is_some()) else {
+                    // Ignore queued responses from a retired stream.
+                    return Ok(());
+                };
+                let response = self.codec.decode_response(bytes)?;
+                active.saw_response = true;
+                self.record_healthy(healthy);
+                self.handle_response(&active.writes, response, done)
+            }
+            TransportEvent::Failed { retry } => {
+                let saw_response = session.take().is_some_and(|s| s.saw_response);
+                // A78 and retry policy count decoded responses, not raw messages.
+                if saw_response {
+                    self.backoff.reset();
+                } else {
+                    self.record_unhealthy(healthy);
+                }
+                let _ = retry.send(self.backoff.next_backoff());
+                Ok(())
+            }
         }
     }
 
@@ -757,104 +790,6 @@ where
         }
 
         Ok(())
-    }
-
-    /// Run the main event loop while connected.
-    ///
-    /// Returns [`ConnectedOutcome::Shutdown`] if the worker should shut down
-    /// (command channel closed), or [`ConnectedOutcome::Failed`] if the stream
-    /// failed and the worker should reconnect (carrying whether a response was
-    /// seen, per gRFC A78).
-    async fn run_connected(
-        &mut self,
-        tx: <TB::Transport as Transport>::Sender,
-        rx: <TB::Transport as Transport>::Receiver,
-        healthy: &mut bool,
-    ) -> ConnectedOutcome {
-        let (write_tx, write_rx) = mpsc::unbounded_channel::<Bytes>();
-        let (read_tx, mut read_rx) = mpsc::channel(1);
-        self.runtime
-            .spawn(Self::run_stream_task(tx, rx, write_rx, read_tx));
-
-        // Send initial DiscoveryRequests for all active subscriptions on this new stream:
-        if self.send_initial_requests(&write_tx).is_err() {
-            return ConnectedOutcome::Failed {
-                saw_response: false,
-            };
-        }
-
-        // Whether at least one response was received on this stream. Per gRFC
-        // A78 a stream that fails *after* receiving a response is not counted as
-        // a server failure.
-        let mut saw_response = false;
-        loop {
-            tokio::select! {
-                res = read_rx.recv() => {
-                    match res {
-                        Some((bytes, done)) => {
-                            let response = match self.codec.decode_response(bytes) {
-                                Ok(response) => response,
-                                Err(_) => return ConnectedOutcome::Failed { saw_response },
-                            };
-                            saw_response = true;
-                            self.record_healthy(healthy);
-                            if self.handle_response(&write_tx, response, done).is_err() {
-                                // All errors are related to sending a request, not `response` whose
-                                // problems are handled by notifying the server.
-                                return ConnectedOutcome::Failed { saw_response };
-                            }
-                        }
-                        None => return ConnectedOutcome::Failed { saw_response },
-                    }
-                }
-                cmd = self.command_rx.recv() => {
-                    match cmd {
-                        Some(WorkerMessage::Command(cmd)) => {
-                            if self.handle_command(Some(&write_tx), cmd).is_err() {
-                                return ConnectedOutcome::Failed { saw_response };
-                            }
-                        }
-                        None => return ConnectedOutcome::Shutdown,
-                    }
-                }
-            }
-        }
-    }
-
-    /// Background task that handles reading from and writing to the ADS stream.
-    ///
-    /// The task has essentially no state. It reads from an unbounded channel and
-    /// writes whatever it reads to the stream. When it reads a message from the
-    /// stream, it forwards it to `read_tx` along with a `ProcessingDone` token,
-    /// and blocks reading from the stream until the token and all shares are
-    /// dropped (ADS flow control). Writes from the unbounded channel continue while
-    /// waiting for `done`.
-    async fn run_stream_task(
-        mut tx: <TB::Transport as Transport>::Sender,
-        mut rx: <TB::Transport as Transport>::Receiver,
-        mut write_rx: mpsc::UnboundedReceiver<Bytes>,
-        read_tx: mpsc::Sender<(Bytes, ProcessingDone)>,
-    ) {
-        let write_loop = async {
-            while let Some(bytes) = write_rx.recv().await {
-                if tx.send(bytes).await.is_err() {
-                    break;
-                }
-            }
-        };
-        let read_loop = async {
-            while let Ok(Some(bytes)) = rx.recv().await {
-                let (done, done_rx) = ProcessingDone::channel();
-                if read_tx.send((bytes, done)).await.is_err() {
-                    break;
-                }
-                let _ = done_rx.await;
-            }
-        };
-        tokio::select! {
-            _ = write_loop => {}
-            _ = read_loop => {}
-        }
     }
 
     /// Handle a command, optionally sending network requests if connected.
@@ -1067,12 +1002,9 @@ where
     /// - Invalid resources are cached as NACKed and errors sent to specific watchers
     /// - Missing resources (for types with ALL_RESOURCES_REQUIRED_IN_SOTW) are marked deleted
     ///
-    /// Cache/state updates and the ACK/NACK happen here, followed by sending
-    /// watcher notifications inline. Because ADS flow control (`ProcessingDone`)
-    /// is awaited in `run_stream_task` before reading the next message, at most
-    /// one response is in flight at a time, and wildcard watches buffer events
-    /// in an unbounded queue, so sending notifications directly cannot fill
-    /// a watcher channel or deadlock.
+    /// Cache/state updates, notification enqueueing, and the ACK/NACK form one
+    /// synchronous actor turn. Watcher queues are unbounded, so a slow watcher
+    /// cannot suspend this turn. `ProcessingDone` gates only the next stream read.
     fn handle_response(
         &mut self,
         sender: &mpsc::UnboundedSender<Bytes>,
@@ -1181,45 +1113,31 @@ where
         resources: Vec<DecodedResource>,
         done: &ProcessingDone,
     ) {
-        let watcher_info: Vec<_> = match self.type_states.get_mut(type_url) {
-            Some(s) => {
-                for resource in &resources {
-                    let resource_name = resource.name().to_string();
-                    s.cache.insert(
-                        resource_name,
-                        CachedResource::received(Arc::new(resource.clone())),
-                    );
-                }
-                let counts = s.resource_state_counts();
-                self.recorder.sync_resource_counts(&s.type_url, &counts);
-                s.watchers
-                    .iter()
-                    .map(|(id, entry)| (*id, entry.event_tx.clone(), entry.subscription.clone()))
-                    .collect()
-            }
-            None => return,
+        let Some(type_state) = self.type_states.get_mut(type_url) else {
+            return;
         };
-
-        // Cancel resource timers for received resources (gRFC A57).
-        for resource in &resources {
-            self.resource_timers
-                .remove(&(type_url.to_string(), resource.name().to_string()));
-        }
 
         for resource in resources {
             let resource_name = resource.name().to_string();
             let resource = Arc::new(resource);
+            type_state.cache.insert(
+                resource_name.clone(),
+                CachedResource::received(Arc::clone(&resource)),
+            );
+            // Cancel the initial resource timer (gRFC A57).
+            self.resource_timers
+                .remove(&(type_url.to_string(), resource_name.clone()));
 
-            for (_watcher_id, event_tx, subscription) in &watcher_info {
-                if subscription.matches(&resource_name) {
-                    let event = ResourceEvent::ResourceChanged {
-                        result: Ok(Arc::clone(&resource)),
-                        done: done.share(),
-                    };
-                    let _ = event_tx.send(event);
-                }
+            for event_tx in type_state.matching_watchers(&resource_name) {
+                let _ = event_tx.send(ResourceEvent::ResourceChanged {
+                    result: Ok(Arc::clone(&resource)),
+                    done: done.share(),
+                });
             }
         }
+        let counts = type_state.resource_state_counts();
+        self.recorder
+            .sync_resource_counts(&type_state.type_url, &counts);
     }
 
     /// Send validation-error notifications for a specific resource.
@@ -1388,12 +1306,13 @@ where
         self.runtime.spawn(async move {
             tokio::select! {
                 _ = runtime.sleep(timeout) => {
-                    if let Some(command_tx) = command_tx.upgrade() {
-                        let _ = command_tx.send(WorkerMessage::Command(WorkerCommand::ResourceTimerExpired {
+                    let _ = send_worker_message(
+                        &command_tx,
+                        WorkerMessage::Command(WorkerCommand::ResourceTimerExpired {
                             type_url: type_url_owned,
                             name,
-                        }));
-                    }
+                        }),
+                    );
                 }
                 _ = cancel_rx => {}
             }
@@ -1439,6 +1358,126 @@ where
             };
             let _ = event_tx.send(event);
         }
+    }
+}
+
+/// Actor-owned state for the current stream. Keeping committed resource state
+/// outside this struct lets cached deliveries survive session cancellation.
+struct ActiveSession {
+    writes: mpsc::UnboundedSender<Bytes>,
+    cancel: Option<oneshot::Sender<()>>,
+    saw_response: bool,
+}
+
+impl ActiveSession {
+    fn new(writes: mpsc::UnboundedSender<Bytes>, cancel: oneshot::Sender<()>) -> Self {
+        Self {
+            writes,
+            cancel: Some(cancel),
+            saw_response: false,
+        }
+    }
+}
+
+// Use a weak sender so background tasks don't prevent worker shutdown
+// after all client handles and watchers are dropped.
+fn send_worker_message(
+    command_tx: &mpsc::WeakUnboundedSender<WorkerMessage>,
+    message: WorkerMessage,
+) -> Result<()> {
+    command_tx
+        .upgrade()
+        .ok_or(Error::StreamClosed)?
+        .send(message)
+        .map_err(|_| Error::StreamClosed)
+}
+
+/// One long-lived lifecycle task. It owns transport handles and waits, but
+/// never reads or mutates resource, subscription, version, or nonce state.
+async fn run_transport<TB: TransportBuilder, R: Runtime>(
+    builder: TB,
+    runtime: R,
+    server: ServerConfig,
+    mut demand: watch::Receiver<bool>,
+    command_tx: &mpsc::WeakUnboundedSender<WorkerMessage>,
+) {
+    loop {
+        // Do not connect without subscriptions. This latest-value signal is
+        // checked between attempts, so local changes never restart setup.
+        if demand.wait_for(|wanted| *wanted).await.is_err() {
+            return;
+        }
+        if let Ok(transport) = builder.build(&server).await
+            && let Ok((tx, rx)) = transport.new_stream().await
+        {
+            let (writes, write_rx) = mpsc::unbounded_channel();
+            let (cancel, cancelled) = oneshot::channel();
+            if send_worker_message(
+                command_tx,
+                WorkerMessage::Transport(TransportEvent::Ready { writes, cancel }),
+            )
+            .is_err()
+            {
+                return;
+            }
+            // Read and write futures live only for this session. Cancelling one
+            // disposes of both; an old completion token cannot resume new I/O.
+            tokio::select! {
+                _ = run_stream::<TB::Transport>(tx, rx, write_rx, command_tx) => {}
+                _ = cancelled => {}
+            }
+        }
+
+        let (retry, decision) = oneshot::channel();
+        if send_worker_message(
+            command_tx,
+            WorkerMessage::Transport(TransportEvent::Failed { retry }),
+        )
+        .is_err()
+        {
+            return;
+        }
+        // The actor knows whether a response decoded successfully and owns the
+        // retry policy. Wait for its concrete delay, then perform the wait here.
+        let Ok(Some(delay)) = decision.await else {
+            return;
+        };
+        runtime.sleep(delay).await;
+    }
+}
+
+/// Concurrent stream I/O within the lifecycle task. ProcessingDone gates reads
+/// only; writes keep running while watchers apply a response.
+async fn run_stream<T: Transport>(
+    mut tx: T::Sender,
+    mut rx: T::Receiver,
+    mut writes: mpsc::UnboundedReceiver<Bytes>,
+    command_tx: &mpsc::WeakUnboundedSender<WorkerMessage>,
+) {
+    let write_loop = async {
+        while let Some(bytes) = writes.recv().await {
+            if tx.send(bytes).await.is_err() {
+                break;
+            }
+        }
+    };
+    let read_loop = async {
+        while let Ok(Some(bytes)) = rx.recv().await {
+            let (done, processed) = ProcessingDone::channel();
+            if send_worker_message(
+                command_tx,
+                WorkerMessage::Transport(TransportEvent::Response { bytes, done }),
+            )
+            .is_err()
+            {
+                break;
+            }
+            let _ = processed.await;
+        }
+    };
+    tokio::select! {
+        _ = write_loop => {}
+        _ = read_loop => {}
     }
 }
 
@@ -1792,19 +1831,30 @@ mod tests {
         connected_client_for::<TestResource>().await
     }
 
-    /// Watch `name` and wait for the resulting subscription request, so the
-    /// watcher is registered before the test sends a response.
-    async fn watch_synced(
-        client: &XdsClient,
-        server: &mut MockServer,
-        name: &str,
-    ) -> ResourceWatcher<TestResource> {
-        let watcher = client.watch::<TestResource>(name).await;
-        let _request = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+    #[tokio::test(start_paused = true)]
+    async fn response_before_watch_is_replayed_from_cache() {
+        let (client, mut watcher_a, _server) = connected_client().await;
+        let (done, processed) = ProcessingDone::channel();
+        client
+            .command_tx
+            .send(WorkerMessage::Transport(TransportEvent::Response {
+                bytes: response("1", "nonce", &["res-0"]),
+                done,
+            }))
+            .unwrap();
+        // Enqueue both inputs before yielding to the actor. The response must
+        // populate the cache before this watch is registered.
+        let mut watcher_b = client.watch::<TestResource>("res-0").await;
+        let (cached, cached_done) = next_changed(&mut watcher_b).await;
+        let (original, original_done) = next_changed(&mut watcher_a).await;
+        assert!(Arc::ptr_eq(&cached.unwrap(), &original.unwrap()));
+        drop(original_done);
+        // Holding the cached token cannot hold the earlier response's signal.
+        tokio::time::timeout(Duration::from_millis(100), processed)
             .await
-            .expect("timed out waiting for subscription request")
-            .expect("stream closed");
-        watcher
+            .expect("later watch was included in the earlier response")
+            .unwrap_err();
+        drop(cached_done);
     }
 
     #[derive(Clone, Copy)]
@@ -2058,6 +2108,200 @@ mod tests {
         cached_eds_during_reconnect(ReconnectPhase::Backoff).await;
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn final_watcher_drop_cancels_pending_connection() {
+        for phase in [ReconnectPhase::Build, ReconnectPhase::Stream] {
+            let (inner, _servers) = mock_transport();
+            let (gates_tx, mut gates) = mpsc::unbounded_channel();
+            let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+                .with_resource_initial_timeout(None);
+            let client = XdsClient::builder(
+                config,
+                GatedBuilder {
+                    inner,
+                    phase,
+                    gates: gates_tx,
+                },
+                FakeCodec,
+                TokioRuntime,
+            )
+            .build();
+            let watcher = client.watch::<TestResource>("res-0").await;
+            let mut gate = gates.recv().await.unwrap();
+            drop(client);
+            // A watcher alone keeps the actor and its pending connection alive.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(100), gate.closed())
+                    .await
+                    .is_err()
+            );
+            drop(watcher);
+            tokio::time::timeout(Duration::from_millis(100), gate.closed())
+                .await
+                .expect("pending connection outlived final watcher");
+            assert!(
+                gates.recv().await.is_none(),
+                "transport builder was retained"
+            );
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn old_session_deliveries_and_tokens_survive_reconnect() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(None);
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut server = servers.recv().await.unwrap();
+        server.requests.recv().await.unwrap();
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        assert_eq!(
+            parse_request(&server.requests.recv().await.unwrap()),
+            ("1".into(), "n1".into())
+        );
+
+        // Keep the committed event queued. Fail a write while the reader waits
+        // for its completion token, forcing disposal of that entire session.
+        drop(server.requests);
+        let _extra = client.watch::<TestResource>("res-1").await;
+        let mut replacement = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("held token blocked reconnect")
+            .unwrap();
+        assert_eq!(
+            parse_request(&replacement.requests.recv().await.unwrap()),
+            ("1".into(), "".into())
+        );
+        let (old, old_done) = next_changed(&mut watcher).await;
+        assert!(old.is_ok(), "committed delivery was lost on disconnect");
+        replacement
+            .responses
+            .send(Ok(Some(response("2", "n2", &["res-0"]))))
+            .unwrap();
+        let (updated, new_done) = next_changed(&mut watcher).await;
+        assert!(updated.is_ok(), "old token blocked replacement stream");
+
+        replacement
+            .responses
+            .send(Ok(Some(response("3", "n3", &["res-0"]))))
+            .unwrap();
+        drop(old_done);
+        assert_no_event(&mut watcher, "old token resumed replacement stream").await;
+        drop(new_done);
+        assert!(next_changed(&mut watcher).await.0.is_ok());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn undecodable_response_retires_session_without_committing_later_data() {
+        let (builder, mut servers) = mock_transport();
+        let recorder = Arc::new(CapturingRecorder::default());
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(None);
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime)
+            .with_metrics_recorder(recorder.clone())
+            .build();
+        let mut watcher = client.watch::<TestResource>("res-0").await;
+        let mut old = servers.recv().await.unwrap();
+        old.requests.recv().await.unwrap();
+        old.responses
+            .send(Ok(Some(Bytes::from_static(&[0xff]))))
+            .unwrap();
+        old.responses
+            .send(Ok(Some(response(
+                "stale-version",
+                "stale-nonce",
+                &["res-0"],
+            ))))
+            .unwrap();
+
+        let mut replacement = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("undecodable response did not close the stream")
+            .unwrap();
+        assert_eq!(
+            parse_request(&replacement.requests.recv().await.unwrap()),
+            ("".into(), "".into())
+        );
+        assert_no_event(&mut watcher, "retired session committed stale data").await;
+        let events = recorder.take();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.instrument == "grpc.xds_client.server_failure")
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.instrument == "grpc.xds_client.connected"
+                    && e.kind == Measurement::Gauge(1))
+                .count(),
+            1
+        );
+
+        replacement
+            .responses
+            .send(Ok(Some(response("1", "new-nonce", &["res-0"]))))
+            .unwrap();
+        assert!(next_changed(&mut watcher).await.0.is_ok());
+        assert!(recorder.take().iter().any(
+            |e| e.instrument == "grpc.xds_client.connected" && e.kind == Measurement::Gauge(1)
+        ));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn lifecycle_waits_for_subscriptions_between_attempts() {
+        let (builder, mut servers) = mock_transport();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(None);
+        let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), servers.recv())
+                .await
+                .is_err(),
+            "connected without a subscription"
+        );
+        let watcher = client.watch::<TestResource>("res-0").await;
+        let mut server = servers.recv().await.unwrap();
+        server.requests.recv().await.unwrap();
+        drop(watcher);
+        server.responses.send(Ok(None)).unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(5), servers.recv())
+                .await
+                .is_err(),
+            "reconnected without subscriptions"
+        );
+        let _watcher = client.watch::<TestResource>("res-2").await;
+        let mut replacement = servers.recv().await.unwrap();
+        let request = replacement.requests.recv().await.unwrap();
+        assert!(
+            String::from_utf8(request.to_vec())
+                .unwrap()
+                .ends_with("res-2")
+        );
+    }
+
+    /// Watch `name` and wait for the resulting subscription request, so the
+    /// watcher is registered before the test sends a response.
+    async fn watch_synced(
+        client: &XdsClient,
+        server: &mut MockServer,
+        name: &str,
+    ) -> ResourceWatcher<TestResource> {
+        let watcher = client.watch::<TestResource>(name).await;
+        let _request = tokio::time::timeout(Duration::from_secs(5), server.requests.recv())
+            .await
+            .expect("timed out waiting for subscription request")
+            .expect("stream closed");
+        watcher
+    }
+
     /// Next event, unwrapped to its result and `ProcessingDone` token.
     async fn next_changed<T: Resource>(
         watcher: &mut ResourceWatcher<T>,
@@ -2268,7 +2512,7 @@ mod tests {
             panic!("expected ResourceChanged(Ok)");
         };
 
-        // Well past COMMAND_CHANNEL_BUFFER_SIZE (64).
+        // More commands than the previous bounded queue could hold.
         let mut extra = Vec::new();
         tokio::time::timeout(Duration::from_secs(5), async {
             for i in 1..=100 {
@@ -2478,7 +2722,7 @@ mod tests {
     }
 
     /// A wildcard watcher receiving a response with more resources than
-    /// `WATCHER_CHANNEL_BUFFER_SIZE` (16) must not deadlock the worker even
+    /// the previous watcher buffer size (16) must not deadlock the worker even
     /// before the watcher reads any events, and ADS flow control must remain
     /// gated until all delivered tokens are dropped.
     #[tokio::test]
@@ -2519,6 +2763,11 @@ mod tests {
         )
         .await
         .expect("worker deadlocked on full wildcard channel");
+
+        // The wildcard watcher has consumed nothing. A second watcher must
+        // still reach the actor and receive the cached resource.
+        let mut cached = client.watch::<TestResource>("res-0").await;
+        assert!(next_changed(&mut cached).await.0.is_ok());
 
         let mut dones = Vec::new();
         for _ in 0..50 {
