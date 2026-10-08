@@ -52,9 +52,8 @@ impl ServerConfig {
     }
 }
 
-/// Default timeout for initial resource response (30 seconds).
-/// gRFC A57 specifies 15 seconds; this retains the existing client default.
-pub const DEFAULT_RESOURCE_INITIAL_TIMEOUT: Duration = Duration::from_secs(30);
+/// Default timeout for initial resource response (15 seconds per gRFC A57).
+pub const DEFAULT_RESOURCE_INITIAL_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Configuration for the xDS client.
 #[derive(Debug, Clone)]
@@ -86,7 +85,7 @@ pub struct ClientConfig {
     /// Stream setup completion currently serves as a readiness proxy; it does not
     /// confirm that the subscription has been dispatched to the network.
     ///
-    /// Default: 30 seconds. Set to `None` to disable the timeout.
+    /// Default: 15 seconds. Set to `None` to disable the timeout.
     pub(crate) resource_initial_timeout: Option<Duration>,
 
     /// gRPC channel target this xDS client serves (per gRFC A78).
@@ -213,5 +212,24 @@ impl ClientConfig {
     pub fn with_target(mut self, target: impl Into<String>) -> Self {
         self.target = Some(target.into());
         self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resource_timeout_defaults_to_fifteen_seconds() {
+        let node = Node::new("test", "0");
+        for config in [
+            ClientConfig::new(node.clone(), "mock:///xds"),
+            ClientConfig::with_servers(node, vec![ServerConfig::new("mock:///xds")]),
+        ] {
+            assert_eq!(
+                config.resource_initial_timeout,
+                Some(Duration::from_secs(15))
+            );
+        }
     }
 }
