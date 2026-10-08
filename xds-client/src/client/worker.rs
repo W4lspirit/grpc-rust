@@ -25,10 +25,10 @@
 //! ADS worker that manages the xDS stream.
 //!
 //! The worker processes watcher and transport events serially. It owns resource
-//! subscriptions, the cache, versions, nonces, and retry policy, and dispatches
+//! subscriptions, the cache, versions, and nonces, and dispatches
 //! watcher notifications and ACK/NACK requests.
 //!
-//! A separate transport task connects, waits until retry deadlines, and reads
+//! A separate transport task owns retry state, connects, waits for backoff, and reads
 //! and writes the ADS stream concurrently. Network waits and watcher processing
 //! do not block the worker from registering watchers or replaying cached resources.
 
@@ -36,13 +36,13 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use bytes::Bytes;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::client::config::{ClientConfig, ServerConfig};
-use crate::client::retry::Backoff;
+use crate::client::retry::{Backoff, RetryPolicy};
 use crate::client::watch::{ProcessingDone, ResourceEvent};
 use crate::codec::XdsCodec;
 use crate::error::{Error, Result};
@@ -559,7 +559,7 @@ pub(crate) enum WatchEvent {
 }
 
 /// Events from the transport lifecycle, in Ready -> Response* -> Failed order.
-/// The lifecycle waits for the actor's retry decision before starting another
+/// The lifecycle waits for the actor to finish processing failure before starting another
 /// session, so events from different sessions cannot interleave.
 pub(crate) enum TransportEvent {
     Ready {
@@ -571,8 +571,8 @@ pub(crate) enum TransportEvent {
         done: ProcessingDone,
     },
     Failed {
-        /// Absolute retry deadline; None means the retry policy is exhausted.
-        retry: oneshot::Sender<Option<Instant>>,
+        /// Reports whether this stream received a successfully decoded response.
+        processed: oneshot::Sender<bool>,
     },
 }
 
@@ -584,11 +584,12 @@ pub(crate) struct AdsWorker<C, R> {
     runtime: R,
     /// Node identification.
     node: Node,
-    /// Backoff calculator for reconnection attempts.
-    backoff: Backoff,
+    /// Retry configuration transferred to the transport task on startup.
+    retry_policy: RetryPolicy,
     /// Priority-ordered list of xDS servers.
     /// Index 0 has the highest priority.
     servers: Vec<ServerConfig>,
+
     /// Timeout for initial resource response (gRFC A57). None = disabled.
     resource_initial_timeout: Option<Duration>,
     /// Weak sender for timer callback commands, so AdsWorker does not keep its own channel open.
@@ -626,7 +627,7 @@ where
             codec,
             runtime,
             node: config.node,
-            backoff: Backoff::new(config.retry_policy),
+            retry_policy: config.retry_policy,
             servers: config.servers,
             resource_initial_timeout: config.resource_initial_timeout,
             command_tx: command_tx.downgrade(),
@@ -644,7 +645,7 @@ where
     /// (which closes the command channel).
     ///
     /// Serialization contract: this task alone mutates subscriptions, cached
-    /// resources, versions, nonces, and retry policy. Each message is handled to
+    /// resources, versions, and nonces. Each message is handled to
     /// completion before the next message is received, including any stream
     /// cancellation caused by that message.
     ///
@@ -666,15 +667,15 @@ where
         let (_shutdown, shutdown_rx) = oneshot::channel::<()>();
         let command_tx = self.command_tx.clone();
         let runtime = self.runtime.clone();
+        let retry_policy = std::mem::take(&mut self.retry_policy);
         let mut transport_task = Some(async move {
             tokio::select! {
-                _ = Self::run_transport(builder, runtime, server, &command_tx) => {}
+                _ = Self::run_transport(builder, runtime, server, retry_policy, &command_tx) => {}
                 // Covers setup, backoff, I/O, and a held ProcessingDone token.
                 _ = shutdown_rx => {}
             }
             let _ = send_worker_command(&command_tx, WorkerCommand::TransportStopped);
         });
-
         // Process each event to completion before receiving the next one, so
         // subscriptions and cached resources change in a defined order.
         // Handlers enqueue requests and notifications without awaiting network
@@ -738,21 +739,14 @@ where
                 self.record_healthy(&mut context.healthy);
                 self.handle_response(&active.writes, response, done)
             }
-            TransportEvent::Failed { retry } => {
+            TransportEvent::Failed { processed } => {
                 // Dropping the handles cancels timers while the stream is unavailable.
                 self.resource_timers.clear();
                 let saw_response = context.session.take().is_some_and(|s| s.saw_response);
-                // A78 and retry policy count decoded responses, not raw messages.
-                if saw_response {
-                    self.backoff.reset();
-                } else {
+                if !saw_response {
                     self.record_unhealthy(&mut context.healthy);
                 }
-                let deadline = self
-                    .backoff
-                    .next_backoff()
-                    .map(|delay| self.runtime.now() + delay);
-                let _ = retry.send(deadline);
+                let _ = processed.send(saw_response);
                 Ok(())
             }
         }
@@ -1389,8 +1383,10 @@ where
         builder: TB,
         runtime: R,
         server: ServerConfig,
+        retry_policy: RetryPolicy,
         command_tx: &mpsc::WeakUnboundedSender<WorkerCommand>,
     ) {
+        let mut backoff = Backoff::new(retry_policy);
         loop {
             if let Ok(transport) = builder.build(&server).await
                 && let Ok((tx, rx)) = transport.new_stream().await
@@ -1413,22 +1409,26 @@ where
                 }
             }
 
-            let (retry, decision) = oneshot::channel();
+            let (processed, completion) = oneshot::channel();
             if send_worker_command(
                 command_tx,
-                WorkerCommand::Transport(TransportEvent::Failed { retry }),
+                WorkerCommand::Transport(TransportEvent::Failed { processed }),
             )
             .is_err()
             {
                 return;
             }
-            // The actor knows whether a response decoded successfully and owns the
-            // retry policy. Its absolute deadline includes time spent waiting to
-            // schedule this task after the decision, rather than adding that delay.
-            let Ok(Some(deadline)) = decision.await else {
+            // Only the actor can distinguish decoded responses from invalid bytes.
+            let Ok(saw_response) = completion.await else {
                 return;
             };
-            runtime.sleep_until(deadline).await;
+            if saw_response {
+                backoff.reset();
+            }
+            let Some(delay) = backoff.next_backoff() else {
+                return;
+            };
+            runtime.sleep(delay).await;
         }
     }
 
@@ -1954,10 +1954,6 @@ mod tests {
             F: std::future::Future<Output = ()> + Send + 'static,
         {
             TokioRuntime.spawn(future);
-        }
-
-        fn now(&self) -> Instant {
-            TokioRuntime.now()
         }
 
         async fn sleep(&self, duration: Duration) {
@@ -2630,6 +2626,57 @@ mod tests {
                 .unwrap()
                 .ends_with("res-2")
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn transport_resets_retry_limit_only_after_a_decoded_response() {
+        for valid_response in [false, true] {
+            let (builder, mut servers) = mock_transport();
+            let policy = crate::RetryPolicy::default()
+                .with_initial_backoff(Duration::from_millis(100))
+                .unwrap()
+                .with_jitter(0.0)
+                .unwrap()
+                .with_max_attempts(Some(1));
+            let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+                .with_resource_initial_timeout(None)
+                .with_retry_policy(policy);
+            let client = XdsClient::builder(config, builder, FakeCodec, TokioRuntime).build();
+            let mut watcher = client.watch::<TestResource>("res-0").await;
+            let mut first = servers.recv().await.unwrap();
+            first.requests.recv().await.unwrap();
+            first.responses.send(Ok(None)).unwrap();
+            let mut second = servers.recv().await.unwrap();
+            second.requests.recv().await.unwrap();
+            if valid_response {
+                second
+                    .responses
+                    .send(Ok(Some(response("1", "n1", &["res-0"]))))
+                    .unwrap();
+                let (resource, done) = next_changed(&mut watcher).await;
+                assert!(resource.is_ok());
+                drop(done);
+                second.requests.recv().await.unwrap();
+                second.responses.send(Ok(None)).unwrap();
+                let mut third = tokio::time::timeout(Duration::from_secs(1), servers.recv())
+                    .await
+                    .expect("decoded response did not reset retry limit")
+                    .unwrap();
+                third.requests.recv().await.unwrap();
+            } else {
+                second
+                    .responses
+                    .send(Ok(Some(Bytes::from_static(&[0xff]))))
+                    .unwrap();
+                assert!(
+                    tokio::time::timeout(Duration::from_secs(1), servers.recv())
+                        .await
+                        .expect("retry limit did not stop the transport")
+                        .is_none(),
+                    "undecodable response reset retry limit"
+                );
+            }
+        }
     }
 
     /// Watch `name` and wait for the resulting subscription request, so the
