@@ -661,7 +661,7 @@ where
 
         // gRFC A78 defines `grpc.xds_client.connected` to be initialized as
         // "For a given server, set to 1 when the stream is initially created."
-        let mut healthy = true;
+        let mut context = StreamContext::new();
         self.recorder.record_connected(true);
         // Only subscription presence crosses this boundary, never a copy of
         // resource names or protocol state. Changes do not restart setup.
@@ -678,7 +678,6 @@ where
             let _ = send_worker_command(&command_tx, WorkerCommand::TransportStopped);
         });
 
-        let mut session: Option<ActiveSession> = None;
         // Process each event to completion before receiving the next one, so
         // subscriptions and cached resources change in a defined order.
         // Handlers enqueue requests and notifications without awaiting network
@@ -686,7 +685,8 @@ where
         while let Some(message) = self.command_rx.recv().await {
             let result = match message {
                 WorkerCommand::Watcher(cmd) => {
-                    let sender = session
+                    let sender = context
+                        .session
                         .as_ref()
                         .filter(|s| s.cancel.is_some())
                         .map(|s| &s.writes);
@@ -694,20 +694,18 @@ where
                     demand_tx.send_replace(!self.type_states.is_empty());
                     result
                 }
-                WorkerCommand::Transport(event) => {
-                    self.handle_transport_event(event, &mut session, &mut healthy)
-                }
+                WorkerCommand::Transport(event) => self.handle_transport_event(event, &mut context),
                 WorkerCommand::TransportStopped => break,
             };
             // Every protocol or write failure retires the stream the same way.
             if result.is_err()
-                && let Some(active) = &mut session
+                && let Some(active) = &mut context.session
             {
                 drop(active.cancel.take());
                 self.resource_timers.clear();
             }
         }
-        if healthy {
+        if context.healthy {
             self.recorder.record_connected(false);
         }
     }
@@ -716,8 +714,7 @@ where
     fn handle_transport_event(
         &mut self,
         event: TransportEvent,
-        session: &mut Option<ActiveSession>,
-        healthy: &mut bool,
+        context: &mut StreamContext,
     ) -> Result<()> {
         match event {
             TransportEvent::Ready { writes, cancel } => {
@@ -727,28 +724,28 @@ where
                 let active = ActiveSession::new(writes, cancel);
                 // Reconcile subscriptions from current actor state after setup.
                 let result = self.send_initial_requests(&active.writes);
-                *session = Some(active);
+                context.session = Some(active);
                 result
             }
             TransportEvent::Response { bytes, done } => {
-                let Some(active) = session.as_mut().filter(|s| s.cancel.is_some()) else {
+                let Some(active) = context.session.as_mut().filter(|s| s.cancel.is_some()) else {
                     // Ignore queued responses from a retired stream.
                     return Ok(());
                 };
                 let response = self.codec.decode_response(bytes)?;
                 active.saw_response = true;
-                self.record_healthy(healthy);
+                self.record_healthy(&mut context.healthy);
                 self.handle_response(&active.writes, response, done)
             }
             TransportEvent::Failed { retry } => {
                 // Dropping the handles cancels timers while the stream is unavailable.
                 self.resource_timers.clear();
-                let saw_response = session.take().is_some_and(|s| s.saw_response);
+                let saw_response = context.session.take().is_some_and(|s| s.saw_response);
                 // A78 and retry policy count decoded responses, not raw messages.
                 if saw_response {
                     self.backoff.reset();
                 } else {
-                    self.record_unhealthy(healthy);
+                    self.record_unhealthy(&mut context.healthy);
                 }
                 let deadline = self
                     .backoff
@@ -1472,6 +1469,21 @@ where
         tokio::select! {
             _ = write_loop => {}
             _ = read_loop => {}
+        }
+    }
+}
+
+/// Actor-owned connection health and active stream.
+struct StreamContext {
+    healthy: bool,
+    session: Option<ActiveSession>,
+}
+
+impl StreamContext {
+    fn new() -> Self {
+        Self {
+            healthy: true,
+            session: None,
         }
     }
 }
