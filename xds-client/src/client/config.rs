@@ -52,7 +52,8 @@ impl ServerConfig {
     }
 }
 
-/// Default timeout for initial resource response (30 seconds per gRFC A57).
+/// Default timeout for initial resource response (30 seconds).
+/// gRFC A57 specifies 15 seconds; this retains the existing client default.
 pub const DEFAULT_RESOURCE_INITIAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Configuration for the xDS client.
@@ -76,8 +77,14 @@ pub struct ClientConfig {
 
     /// Timeout for initial resource response (gRFC A57).
     ///
-    /// If a watched resource is not received within this duration after the watch
-    /// is registered, watchers receive a `ResourceDoesNotExist` error.
+    /// For an uncached resource, the timeout starts after its subscription is queued
+    /// following transport stream setup. A stream failure cancels the timeout;
+    /// resubscribing on the replacement stream starts a full timeout again.
+    /// If the resource is not received before expiration, watchers receive a
+    /// `ResourceDoesNotExist` error.
+    ///
+    /// Stream setup completion currently serves as a readiness proxy; it does not
+    /// confirm that the subscription has been dispatched to the network.
     ///
     /// Default: 30 seconds. Set to `None` to disable the timeout.
     pub(crate) resource_initial_timeout: Option<Duration>,

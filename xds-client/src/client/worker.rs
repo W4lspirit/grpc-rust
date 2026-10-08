@@ -553,6 +553,8 @@ pub(crate) enum WatchEvent {
         type_url: String,
         /// The resource name.
         name: String,
+        /// Identifies the timer, so cancelled expirations cannot affect its replacement.
+        timer_id: u64,
     },
 }
 
@@ -597,7 +599,9 @@ pub(crate) struct AdsWorker<C, R> {
     type_states: HashMap<String, TypeState>,
     /// Cancellation handles for resource timers (gRFC A57).
     /// Key is (type_url, resource_name). Dropping the sender cancels the timer.
-    resource_timers: HashMap<(String, String), oneshot::Sender<()>>,
+    resource_timers: HashMap<(String, String), (u64, oneshot::Sender<()>)>,
+    /// IDs are never reused, including across reconnects and subscription removal.
+    next_resource_timer_id: u64,
     /// Optional backend + per-client A78 metric attributes
     /// (`grpc.target` + `grpc.xds.server`).
     recorder: RecorderHandle,
@@ -629,6 +633,7 @@ where
             command_rx,
             type_states: HashMap::new(),
             resource_timers: HashMap::new(),
+            next_resource_timer_id: 0,
             recorder: RecorderHandle::new(recorder, target),
         }
     }
@@ -699,6 +704,7 @@ where
                 && let Some(active) = &mut session
             {
                 drop(active.cancel.take());
+                self.resource_timers.clear();
             }
         }
         if healthy {
@@ -735,6 +741,8 @@ where
                 self.handle_response(&active.writes, response, done)
             }
             TransportEvent::Failed { retry } => {
+                // Dropping the handles cancels timers while the stream is unavailable.
+                self.resource_timers.clear();
                 let saw_response = session.take().is_some_and(|s| s.saw_response);
                 // A78 and retry policy count decoded responses, not raw messages.
                 if saw_response {
@@ -777,25 +785,15 @@ where
     }
 
     /// Send initial DiscoveryRequests for all active subscriptions.
-    fn send_initial_requests(&self, sender: &mpsc::UnboundedSender<Bytes>) -> Result<()> {
-        for (type_url, type_state) in &self.type_states {
-            if type_state.watchers.is_empty() {
-                continue;
-            }
-
-            let resource_names = type_state.resource_names_for_request();
-
-            let request = DiscoveryRequest {
-                node: &self.node,
-                type_url,
-                resource_names: &resource_names,
-                version_info: &type_state.version_info,
-                response_nonce: "", // Initial request has empty nonce
-                error_detail: None,
-            };
-
-            let bytes = self.codec.encode_request(&request)?;
-            sender.send(bytes).map_err(|_| Error::StreamClosed)?;
+    fn send_initial_requests(&mut self, sender: &mpsc::UnboundedSender<Bytes>) -> Result<()> {
+        let type_urls: Vec<_> = self
+            .type_states
+            .iter()
+            .filter(|(_, state)| !state.watchers.is_empty())
+            .map(|(type_url, _)| type_url.clone())
+            .collect();
+        for type_url in type_urls {
+            self.send_request(sender, &type_url)?;
         }
 
         Ok(())
@@ -820,16 +818,22 @@ where
                 decoder,
                 all_resources_required_in_sotw,
             } => {
-                if self.add_watcher(
+                let subscriptions_changed = self.add_watcher(
                     type_url,
                     name,
                     watcher_id,
                     event_tx,
                     decoder,
                     all_resources_required_in_sotw,
-                ) && let Some(sender) = sender
-                {
-                    self.send_request(sender, type_url)?;
+                );
+                if let Some(sender) = sender {
+                    if subscriptions_changed {
+                        self.send_request(sender, type_url)?;
+                    } else {
+                        // The current subscription already covers this watch,
+                        // including a named watch added under a wildcard.
+                        self.start_pending_resource_timers(type_url);
+                    }
                 }
             }
             WatchEvent::Unwatch { watcher_id } => {
@@ -839,8 +843,12 @@ where
                     self.send_request(sender, &type_url)?;
                 }
             }
-            WatchEvent::ResourceTimerExpired { type_url, name } => {
-                self.handle_resource_timeout(&type_url, &name);
+            WatchEvent::ResourceTimerExpired {
+                type_url,
+                name,
+                timer_id,
+            } => {
+                self.handle_resource_timeout(&type_url, &name, timer_id);
             }
         }
         Ok(())
@@ -870,8 +878,6 @@ where
         let old_subscription = type_state.subscription.clone();
         let watcher_subscription = WatcherSubscription::from_name(name.clone());
 
-        // Track if we need to start a timer (resource in Requested state)
-        let mut start_timer_for: Option<String> = None;
         // Track newly-inserted cache entry for the resources gauge (None -> Requested).
         let mut was_new = false;
 
@@ -889,11 +895,6 @@ where
             if let Some(event) = cached.to_event() {
                 // Enqueue cached state without waiting for the watcher.
                 let _ = event_tx.send(event);
-            }
-
-            if cached.is_requested() {
-                // Resource pending - start a timer (gRFC A57)
-                start_timer_for = Some(resource_name.clone());
             }
         }
 
@@ -913,13 +914,6 @@ where
             let counts = type_state.resource_state_counts();
             self.recorder
                 .sync_resource_counts(&type_state.type_url, &counts);
-        }
-
-        // Start timer if resource is in Requested state
-        if let (Some(resource_name), Some(timeout)) =
-            (start_timer_for, self.resource_initial_timeout)
-        {
-            self.start_resource_timer(&type_url_string, resource_name, timeout);
         }
 
         subscriptions_changed
@@ -957,7 +951,11 @@ where
     }
 
     /// Send a DiscoveryRequest for a type to the unbounded write channel.
-    fn send_request(&self, sender: &mpsc::UnboundedSender<Bytes>, type_url: &str) -> Result<()> {
+    fn send_request(
+        &mut self,
+        sender: &mpsc::UnboundedSender<Bytes>,
+        type_url: &str,
+    ) -> Result<()> {
         let type_state = match self.type_states.get(type_url) {
             Some(s) => s,
             None => return Ok(()),
@@ -975,7 +973,36 @@ where
 
         let bytes = self.codec.encode_request(&request)?;
         sender.send(bytes).map_err(|_| Error::StreamClosed)?;
+        self.start_pending_resource_timers(type_url);
         Ok(())
+    }
+
+    fn start_pending_resource_timers(&mut self, type_url: &str) {
+        // Use new_stream() completion as a readiness fallback, then start timers
+        // after queuing subscriptions. Reconnect uses this same path.
+        // This is a readiness proxy: Tonic's service readiness does not confirm
+        // channel connectivity or stream dispatch as required by A57.
+        let Some(timeout) = self.resource_initial_timeout else {
+            return;
+        };
+        let Some(type_state) = self.type_states.get(type_url) else {
+            return;
+        };
+        let pending: Vec<_> = type_state
+            .watchers
+            .values()
+            .filter_map(|watcher| match &watcher.subscription {
+                WatcherSubscription::Named(name)
+                    if type_state.cache.get(name).is_some_and(|c| c.is_requested()) =>
+                {
+                    Some(name.clone())
+                }
+                _ => None,
+            })
+            .collect();
+        for name in pending {
+            self.start_resource_timer(type_url, name, timeout);
+        }
     }
 
     /// Handle a response from the server. Problems with `response` will be handled directly, and
@@ -1285,6 +1312,10 @@ where
         }
 
         let (cancel_tx, cancel_rx) = oneshot::channel::<()>();
+        let timer_id = self.next_resource_timer_id;
+        self.next_resource_timer_id = timer_id
+            .checked_add(1)
+            .expect("resource timer IDs exhausted");
         let type_url_owned = type_url.to_string();
         let command_tx = self.command_tx.clone();
         let runtime = self.runtime.clone();
@@ -1297,6 +1328,7 @@ where
                         WorkerCommand::Watcher(WatchEvent::ResourceTimerExpired {
                             type_url: type_url_owned,
                             name,
+                            timer_id,
                         }),
                     );
                 }
@@ -1304,16 +1336,23 @@ where
             }
         });
 
-        self.resource_timers.insert(key, cancel_tx);
+        self.resource_timers.insert(key, (timer_id, cancel_tx));
     }
 
     /// Handle a resource timer expiration (gRFC A57).
     ///
     /// If the resource is still in Requested state, marks it as DoesNotExist
     /// and notifies all watchers interested in this resource.
-    fn handle_resource_timeout(&mut self, type_url: &str, name: &str) {
-        self.resource_timers
-            .remove(&(type_url.to_string(), name.to_string()));
+    fn handle_resource_timeout(&mut self, type_url: &str, name: &str, timer_id: u64) {
+        // Cancellation cannot retract an expiration already in the command queue.
+        let key = (type_url.to_string(), name.to_string());
+        let Entry::Occupied(timer) = self.resource_timers.entry(key) else {
+            return;
+        };
+        if timer.get().0 != timer_id {
+            return;
+        }
+        timer.remove();
 
         let type_state = match self.type_states.get_mut(type_url) {
             Some(s) => s,
@@ -1897,13 +1936,11 @@ mod tests {
         }
     }
 
-    #[cfg(feature = "codegen-prost")]
     #[derive(Clone)]
     struct ObservedRuntime {
         sleeps: mpsc::UnboundedSender<Duration>,
     }
 
-    #[cfg(feature = "codegen-prost")]
     impl Runtime for ObservedRuntime {
         fn spawn<F>(&self, future: F)
         where
@@ -2097,6 +2134,313 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn cached_eds_replayed_during_backoff() {
         cached_eds_during_reconnect(ReconnectPhase::Backoff).await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resource_timer_waits_for_initial_stream() {
+        for phase in [ReconnectPhase::Build, ReconnectPhase::Stream] {
+            let (inner, mut servers) = mock_transport();
+            let (gates_tx, mut gates) = mpsc::unbounded_channel();
+            let timeout = Duration::from_secs(15);
+            let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+                .with_resource_initial_timeout(Some(timeout));
+            let client = XdsClient::builder(
+                config,
+                GatedBuilder {
+                    inner,
+                    phase,
+                    gates: gates_tx,
+                },
+                FakeCodec,
+                TokioRuntime,
+            )
+            .build();
+            let mut watcher = client.watch::<TestResource>("res-0").await;
+            let gate = gates.recv().await.unwrap();
+            tokio::time::advance(timeout * 2).await;
+            assert_no_event(
+                &mut watcher,
+                "resource expired before the initial stream was ready",
+            )
+            .await;
+            assert!(!gate.is_closed());
+            assert!(servers.try_recv().is_err());
+            gate.send(()).unwrap();
+            let mut server = servers.recv().await.unwrap();
+            server.requests.recv().await.unwrap();
+            tokio::time::advance(timeout - Duration::from_secs(1)).await;
+            assert_no_event(&mut watcher, "setup time shortened the resource deadline").await;
+            let (result, _done) =
+                tokio::time::timeout(Duration::from_secs(1), next_changed(&mut watcher))
+                    .await
+                    .expect("initial subscription did not start a timer");
+            assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn additional_watcher_does_not_reset_resource_timer() {
+        let (builder, mut servers) = mock_transport();
+        let (sleeps_tx, mut sleeps) = mpsc::unbounded_channel();
+        let timeout = Duration::from_secs(15);
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(Some(timeout));
+        let client = XdsClient::builder(
+            config,
+            builder,
+            FakeCodec,
+            ObservedRuntime { sleeps: sleeps_tx },
+        )
+        .build();
+        let mut first = client.watch::<TestResource>("res-0").await;
+        let mut server = servers.recv().await.unwrap();
+        server.requests.recv().await.unwrap();
+        assert_eq!(sleeps.recv().await.unwrap(), timeout);
+        tokio::time::advance(Duration::from_secs(10)).await;
+        let mut second = client.watch::<TestResource>("res-0").await;
+        // Changing another subscription exercises the shared send/timer path too.
+        let _other = client.watch::<TestResource>("res-1").await;
+        server.requests.recv().await.unwrap();
+        tokio::time::advance(Duration::from_secs(5)).await;
+        for watcher in [&mut first, &mut second] {
+            let (result, _done) =
+                tokio::time::timeout(Duration::from_millis(100), next_changed(watcher))
+                    .await
+                    .expect("additional watcher reset the original deadline");
+            assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn named_watch_under_wildcard_starts_resource_timer() {
+        let (builder, mut servers) = mock_transport();
+        let (sleeps_tx, mut sleeps) = mpsc::unbounded_channel();
+        let timeout = Duration::from_secs(15);
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(Some(timeout));
+        let client = XdsClient::builder(
+            config,
+            builder,
+            FakeCodec,
+            ObservedRuntime { sleeps: sleeps_tx },
+        )
+        .build();
+        let _wildcard = client.watch::<TestResource>("").await;
+        let mut server = servers.recv().await.unwrap();
+        server.requests.recv().await.unwrap();
+        let mut named = client.watch::<TestResource>("res-0").await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_millis(100), sleeps.recv())
+                .await
+                .expect("named watch under wildcard did not start a timer")
+                .unwrap(),
+            timeout,
+        );
+        assert!(
+            server.requests.try_recv().is_err(),
+            "wildcard already covers the named resource"
+        );
+        tokio::time::advance(timeout).await;
+        let (result, _done) = next_changed(&mut named).await;
+        assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cached_resource_does_not_start_another_timer() {
+        let (builder, mut servers) = mock_transport();
+        let (sleeps_tx, mut sleeps) = mpsc::unbounded_channel();
+        let timeout = Duration::from_secs(15);
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(Some(timeout));
+        let client = XdsClient::builder(
+            config,
+            builder,
+            FakeCodec,
+            ObservedRuntime { sleeps: sleeps_tx },
+        )
+        .build();
+        let mut first = client.watch::<TestResource>("res-0").await;
+        let mut server = servers.recv().await.unwrap();
+        server.requests.recv().await.unwrap();
+        assert_eq!(sleeps.recv().await.unwrap(), timeout);
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        let (original, done) = next_changed(&mut first).await;
+        drop(done);
+        server.requests.recv().await.unwrap();
+        let mut cached = client.watch::<TestResource>("res-0").await;
+        let (replayed, done) = next_changed(&mut cached).await;
+        assert!(Arc::ptr_eq(&original.unwrap(), &replayed.unwrap()));
+        drop(done);
+        // A new unresolved name should be the only new timer on this request.
+        let _other = client.watch::<TestResource>("res-1").await;
+        server.requests.recv().await.unwrap();
+        assert_eq!(sleeps.recv().await.unwrap(), timeout);
+        tokio::time::advance(timeout * 2).await;
+        assert_no_event(&mut first, "cached resource expired").await;
+        assert_no_event(&mut cached, "cached replay started a timer").await;
+        assert!(
+            sleeps.try_recv().is_err(),
+            "cached resource started an extra timer"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resource_timer_is_stopped_during_backoff() {
+        let (builder, mut servers) = mock_transport();
+        let (sleeps_tx, mut sleeps) = mpsc::unbounded_channel();
+        let timeout = Duration::from_secs(15);
+        let backoff = Duration::from_secs(60);
+        let policy = crate::RetryPolicy::default()
+            .with_max_backoff(backoff)
+            .unwrap()
+            .with_initial_backoff(backoff)
+            .unwrap()
+            .with_jitter(0.0)
+            .unwrap();
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(Some(timeout))
+            .with_retry_policy(policy);
+        let client = XdsClient::builder(
+            config,
+            builder,
+            FakeCodec,
+            ObservedRuntime { sleeps: sleeps_tx },
+        )
+        .build();
+        let mut first = client.watch::<TestResource>("res-0").await;
+        let mut server = servers.recv().await.unwrap();
+        server.requests.recv().await.unwrap();
+        assert_eq!(sleeps.recv().await.unwrap(), timeout);
+        server.responses.send(Ok(None)).unwrap();
+        assert_eq!(sleeps.recv().await.unwrap(), backoff);
+        let mut second = client.watch::<TestResource>("res-1").await;
+        tokio::time::advance(timeout * 2).await;
+        assert_no_event(&mut first, "existing resource expired during backoff").await;
+        assert_no_event(&mut second, "new resource expired during backoff").await;
+        assert!(servers.try_recv().is_err(), "backoff ended early");
+        assert!(
+            sleeps.try_recv().is_err(),
+            "new watch started a timer during backoff"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uncached_resource_does_not_expire_while_reconnect_is_pending() {
+        for phase in [ReconnectPhase::Build, ReconnectPhase::Stream] {
+            uncached_resource_during_reconnect(phase).await;
+        }
+    }
+
+    async fn uncached_resource_during_reconnect(phase: ReconnectPhase) {
+        let (inner, mut servers) = mock_transport();
+        let (gates_tx, mut gates) = mpsc::unbounded_channel();
+        let timeout = Duration::from_secs(15);
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(Some(timeout));
+        let client = XdsClient::builder(
+            config,
+            GatedBuilder {
+                inner,
+                phase,
+                gates: gates_tx,
+            },
+            FakeCodec,
+            TokioRuntime,
+        )
+        .build();
+        let mut cached = client.watch::<TestResource>("res-0").await;
+        gates.recv().await.unwrap().send(()).unwrap();
+        let mut server = servers.recv().await.unwrap();
+        server.requests.recv().await.unwrap();
+        server
+            .responses
+            .send(Ok(Some(response("1", "n1", &["res-0"]))))
+            .unwrap();
+        let (resource, done) = next_changed(&mut cached).await;
+        assert!(resource.is_ok());
+        drop(done);
+        server.requests.recv().await.unwrap();
+        server.responses.send(Ok(None)).unwrap();
+        let gate = gates.recv().await.unwrap();
+
+        let mut unresolved = client.watch::<TestResource>("res-1").await;
+        // Cached replay confirms the preceding registration was processed.
+        let mut barrier = client.watch::<TestResource>("res-0").await;
+        assert!(next_changed(&mut barrier).await.0.is_ok());
+
+        tokio::time::advance(timeout).await;
+        let event = tokio::time::timeout(Duration::from_millis(100), unresolved.next()).await;
+        assert!(!gate.is_closed(), "reconnect attempt was cancelled");
+        assert!(servers.try_recv().is_err(), "reconnect gate was bypassed");
+        assert!(
+            event.is_err(),
+            "uncached resource expired before its subscription was sent: {event:?}"
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn resource_timer_is_cancelled_on_disconnect_and_restarted_on_reconnect() {
+        let (inner, mut servers) = mock_transport();
+        let (gates_tx, mut gates) = mpsc::unbounded_channel();
+        let timeout = Duration::from_secs(15);
+        let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
+            .with_resource_initial_timeout(Some(timeout));
+        let client = XdsClient::builder(
+            config,
+            GatedBuilder {
+                inner,
+                phase: ReconnectPhase::Build,
+                gates: gates_tx,
+            },
+            FakeCodec,
+            TokioRuntime,
+        )
+        .build();
+        let mut watcher = client.watch::<TestResource>("res-0").await;
+        gates.recv().await.unwrap().send(()).unwrap();
+        let mut server = servers.recv().await.unwrap();
+        server.requests.recv().await.unwrap();
+        // Part of the first deadline elapses without a resource response.
+        tokio::time::advance(Duration::from_secs(5)).await;
+        server.responses.send(Ok(None)).unwrap();
+        let gate = gates.recv().await.unwrap();
+
+        // Disconnected time must not cause a resource absence notification.
+        tokio::time::advance(timeout).await;
+        assert!(!gate.is_closed(), "reconnect attempt was cancelled");
+        assert!(servers.try_recv().is_err(), "reconnect gate was bypassed");
+        assert_no_event(&mut watcher, "resource timer kept running after disconnect").await;
+
+        gate.send(()).unwrap();
+        let mut replacement = servers.recv().await.unwrap();
+        replacement.requests.recv().await.unwrap();
+        // An expiration queued by the first stream must not consume the
+        // replacement stream's timer for the same resource.
+        client
+            .command_tx
+            .send(WorkerCommand::Watcher(WatchEvent::ResourceTimerExpired {
+                type_url: TEST_TYPE_URL.to_string(),
+                name: "res-0".to_string(),
+                timer_id: 0,
+            }))
+            .unwrap();
+        assert_no_event(
+            &mut watcher,
+            "stale expiration consumed the replacement timer",
+        )
+        .await;
+        // Reconnection grants a full deadline, rather than the remaining time
+        // from the first stream. No server response is needed for expiration.
+        tokio::time::advance(timeout - Duration::from_secs(1)).await;
+        assert_no_event(&mut watcher, "reconnect did not restart the full deadline").await;
+        let (result, _done) =
+            tokio::time::timeout(Duration::from_secs(1), next_changed(&mut watcher))
+                .await
+                .expect("resource timer was not restarted after reconnect");
+        assert!(matches!(result, Err(Error::ResourceDoesNotExist)));
     }
 
     #[tokio::test(start_paused = true)]
