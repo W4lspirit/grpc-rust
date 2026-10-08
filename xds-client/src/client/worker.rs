@@ -39,7 +39,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use bytes::Bytes;
-use tokio::sync::{mpsc, oneshot, watch};
+use tokio::sync::{mpsc, oneshot};
 
 use crate::client::config::{ClientConfig, ServerConfig};
 use crate::client::retry::Backoff;
@@ -663,15 +663,12 @@ where
         // "For a given server, set to 1 when the stream is initially created."
         let mut context = StreamContext::new();
         self.recorder.record_connected(true);
-        // Only subscription presence crosses this boundary, never a copy of
-        // resource names or protocol state. Changes do not restart setup.
-        let (demand_tx, demand_rx) = watch::channel(false);
         let (_shutdown, shutdown_rx) = oneshot::channel::<()>();
         let command_tx = self.command_tx.clone();
         let runtime = self.runtime.clone();
-        self.runtime.spawn(async move {
+        let mut transport_task = Some(async move {
             tokio::select! {
-                _ = Self::run_transport(builder, runtime, server, demand_rx, &command_tx) => {}
+                _ = Self::run_transport(builder, runtime, server, &command_tx) => {}
                 // Covers setup, backoff, I/O, and a held ProcessingDone token.
                 _ = shutdown_rx => {}
             }
@@ -691,7 +688,11 @@ where
                         .filter(|s| s.cancel.is_some())
                         .map(|s| &s.writes);
                     let result = self.handle_command(sender, cmd);
-                    demand_tx.send_replace(!self.type_states.is_empty());
+                    if !self.type_states.is_empty()
+                        && let Some(task) = transport_task.take()
+                    {
+                        self.runtime.spawn(task);
+                    }
                     result
                 }
                 WorkerCommand::Transport(event) => self.handle_transport_event(event, &mut context),
@@ -1388,15 +1389,9 @@ where
         builder: TB,
         runtime: R,
         server: ServerConfig,
-        mut demand: watch::Receiver<bool>,
         command_tx: &mpsc::WeakUnboundedSender<WorkerCommand>,
     ) {
         loop {
-            // Do not connect without subscriptions. This latest-value signal is
-            // checked between attempts, so local changes never restart setup.
-            if demand.wait_for(|wanted| *wanted).await.is_err() {
-                return;
-            }
             if let Ok(transport) = builder.build(&server).await
                 && let Ok((tx, rx)) = transport.new_stream().await
             {
@@ -2602,7 +2597,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn lifecycle_waits_for_subscriptions_between_attempts() {
+    async fn lifecycle_starts_on_first_watch_and_keeps_reconnecting() {
         let (builder, mut servers) = mock_transport();
         let config = ClientConfig::new(Node::new("test", "0"), "mock:///xds")
             .with_resource_initial_timeout(None);
@@ -2618,14 +2613,17 @@ mod tests {
         server.requests.recv().await.unwrap();
         drop(watcher);
         server.responses.send(Ok(None)).unwrap();
+        let mut replacement = tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            .await
+            .expect("lifecycle stopped after the last unwatch")
+            .unwrap();
         assert!(
-            tokio::time::timeout(Duration::from_secs(5), servers.recv())
+            tokio::time::timeout(Duration::from_millis(100), replacement.requests.recv())
                 .await
                 .is_err(),
-            "reconnected without subscriptions"
+            "sent a request without subscriptions"
         );
         let _watcher = client.watch::<TestResource>("res-2").await;
-        let mut replacement = servers.recv().await.unwrap();
         let request = replacement.requests.recv().await.unwrap();
         assert!(
             String::from_utf8(request.to_vec())
