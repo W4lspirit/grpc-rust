@@ -722,7 +722,7 @@ where
                 for state in self.type_states.values_mut() {
                     state.nonce.clear();
                 }
-                let active = ActiveSession::new(writes, cancel);
+                let active = ActiveStream::new(writes, cancel);
                 // Reconcile subscriptions from current actor state after setup.
                 let result = self.send_initial_requests(&active.writes);
                 context.session = Some(active);
@@ -1494,7 +1494,7 @@ impl<R, TB> TransportContext<R, TB> {
 /// Actor-owned connection health and active stream.
 struct StreamContext {
     healthy: bool,
-    session: Option<ActiveSession>,
+    session: Option<ActiveStream>,
 }
 
 impl StreamContext {
@@ -1508,13 +1508,13 @@ impl StreamContext {
 
 /// Actor-owned state for the current stream. Keeping committed resource state
 /// outside this struct lets cached deliveries survive session cancellation.
-struct ActiveSession {
+struct ActiveStream {
     writes: mpsc::UnboundedSender<Bytes>,
     cancel: Option<oneshot::Sender<()>>,
     saw_response: bool,
 }
 
-impl ActiveSession {
+impl ActiveStream {
     fn new(writes: mpsc::UnboundedSender<Bytes>, cancel: oneshot::Sender<()>) -> Self {
         Self {
             writes,
