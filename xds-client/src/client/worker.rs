@@ -559,6 +559,7 @@ pub(crate) enum WatchEvent {
 }
 
 /// Events from the transport lifecycle, in Ready -> Response* -> Failed order.
+/// Connection or stream setup failures emit Failed without a preceding Ready.
 /// The lifecycle waits for the actor to finish processing failure before starting another
 /// session, so events from different sessions cannot interleave.
 pub(crate) enum TransportEvent {
@@ -648,14 +649,7 @@ where
         mut self,
         transport_context: TransportContext<R, TB>,
     ) {
-        let TransportContext {
-            runtime,
-            builder,
-            servers,
-            retry_policy,
-        } = transport_context;
-        // Future extension (gRFC A71): Try servers in priority order with fallback.
-        let server = match servers.into_iter().next() {
+        let server = match transport_context.servers.first() {
             Some(server) => server,
             None => return, // No servers configured
         };
@@ -669,7 +663,7 @@ where
         let command_tx = self.command_tx.clone();
         let mut transport_task = Some(async move {
             tokio::select! {
-                _ = Self::run_transport(builder, runtime, server, retry_policy, &command_tx) => {}
+                _ = Self::run_transport(transport_context, &command_tx) => {}
                 // Covers setup, backoff, I/O, and a held ProcessingDone token.
                 _ = shutdown_rx => {}
             }
@@ -847,7 +841,8 @@ where
 
     /// Add a watcher to the state.
     ///
-    /// If the resource is already cached, the watcher receives the cached state immediately.
+    /// A named watcher receives any cached state immediately. Wildcard watchers
+    /// receive subsequent updates without replaying the cache.
     /// Returns true if subscriptions changed (need to send new request to server).
     fn add_watcher(
         &mut self,
@@ -969,10 +964,9 @@ where
     }
 
     fn start_pending_resource_timers(&mut self, type_url: &str) {
-        // Use new_stream() completion as a readiness fallback, then start timers
-        // after queuing subscriptions. Reconnect uses this same path.
-        // This is a readiness proxy: Tonic's service readiness does not confirm
-        // channel connectivity or stream dispatch as required by A57.
+        // Start timers after queuing subscriptions following new_stream().
+        // Its completion is our readiness proxy, not proof of channel connectivity
+        // or stream dispatch as required by A57. Reconnect uses this same path.
         let Some(timeout) = self.resource_initial_timeout else {
             return;
         };
@@ -1379,15 +1373,16 @@ where
     /// One long-lived lifecycle task. It owns transport handles and waits, but
     /// never reads or mutates resource, subscription, version, or nonce state.
     async fn run_transport<TB: TransportBuilder>(
-        builder: TB,
-        runtime: R,
-        server: ServerConfig,
-        retry_policy: RetryPolicy,
+        context: TransportContext<R, TB>,
         command_tx: &mpsc::WeakUnboundedSender<WorkerCommand>,
     ) {
-        let mut backoff = Backoff::new(retry_policy);
+        // Future extension (gRFC A71): Try servers in priority order with fallback.
+        let Some(server) = context.servers.first() else {
+            return;
+        };
+        let mut backoff = Backoff::new(context.retry_policy);
         loop {
-            if let Ok(transport) = builder.build(&server).await
+            if let Ok(transport) = context.builder.build(server).await
                 && let Ok((tx, rx)) = transport.new_stream().await
             {
                 let (writes, write_rx) = mpsc::unbounded_channel();
@@ -1427,7 +1422,7 @@ where
             let Some(delay) = backoff.next_backoff() else {
                 return;
             };
-            runtime.sleep(delay).await;
+            context.runtime.sleep(delay).await;
         }
     }
 
@@ -1491,7 +1486,7 @@ impl<R, TB> TransportContext<R, TB> {
     }
 }
 
-/// Actor-owned connection health and active stream.
+/// Tracks server health across reconnects and the current stream, if any.
 struct StreamContext {
     healthy: bool,
     session: Option<ActiveStream>,
@@ -1506,8 +1501,8 @@ impl StreamContext {
     }
 }
 
-/// Actor-owned state for the current stream. Keeping committed resource state
-/// outside this struct lets cached deliveries survive session cancellation.
+/// Holds the current stream's request queue, cancellation signal, and response history.
+/// Cached resources stay in the worker so retiring this stream does not discard them.
 struct ActiveStream {
     writes: mpsc::UnboundedSender<Bytes>,
     cancel: Option<oneshot::Sender<()>>,
