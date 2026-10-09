@@ -584,12 +584,6 @@ pub(crate) struct AdsWorker<C, R> {
     runtime: R,
     /// Node identification.
     node: Node,
-    /// Retry configuration transferred to the transport task on startup.
-    retry_policy: RetryPolicy,
-    /// Priority-ordered list of xDS servers.
-    /// Index 0 has the highest priority.
-    servers: Vec<ServerConfig>,
-
     /// Timeout for initial resource response (gRFC A57). None = disabled.
     resource_initial_timeout: Option<Duration>,
     /// Weak sender for timer callback commands, so AdsWorker does not keep its own channel open.
@@ -617,18 +611,16 @@ where
     pub(crate) fn new(
         codec: C,
         runtime: R,
-        config: ClientConfig,
+        config: &ClientConfig,
         command_tx: mpsc::UnboundedSender<WorkerCommand>,
         command_rx: mpsc::UnboundedReceiver<WorkerCommand>,
         recorder: Option<Arc<dyn MetricsRecorder>>,
     ) -> Self {
-        let target: Arc<str> = Arc::from(config.target.unwrap_or_default());
+        let target: Arc<str> = Arc::from(config.target.clone().unwrap_or_default());
         Self {
             codec,
             runtime,
-            node: config.node,
-            retry_policy: config.retry_policy,
-            servers: config.servers,
+            node: config.node.clone(),
             resource_initial_timeout: config.resource_initial_timeout,
             command_tx: command_tx.downgrade(),
             command_rx,
@@ -652,10 +644,19 @@ where
     /// Handlers must stay synchronous and must not block on network operations,
     /// watcher consumption, or ProcessingDone. They enqueue writes and watcher
     /// events; the transport task performs connection, retry, and I/O waits.
-    pub(crate) async fn run<TB: TransportBuilder>(mut self, builder: TB) {
+    pub(crate) async fn run<TB: TransportBuilder>(
+        mut self,
+        transport_context: TransportContext<R, TB>,
+    ) {
+        let TransportContext {
+            runtime,
+            builder,
+            servers,
+            retry_policy,
+        } = transport_context;
         // Future extension (gRFC A71): Try servers in priority order with fallback.
-        let server = match self.servers.first() {
-            Some(s) => s.clone(),
+        let server = match servers.into_iter().next() {
+            Some(server) => server,
             None => return, // No servers configured
         };
         self.recorder.set_server(Arc::from(server.uri()));
@@ -666,8 +667,6 @@ where
         self.recorder.record_connected(true);
         let (_shutdown, shutdown_rx) = oneshot::channel::<()>();
         let command_tx = self.command_tx.clone();
-        let runtime = self.runtime.clone();
-        let retry_policy = std::mem::take(&mut self.retry_policy);
         let mut transport_task = Some(async move {
             tokio::select! {
                 _ = Self::run_transport(builder, runtime, server, retry_policy, &command_tx) => {}
@@ -1464,6 +1463,30 @@ where
         tokio::select! {
             _ = write_loop => {}
             _ = read_loop => {}
+        }
+    }
+}
+
+/// Runtime, transport builder, and configuration owned by the lifecycle task.
+pub(crate) struct TransportContext<R, TB> {
+    runtime: R,
+    builder: TB,
+    servers: Vec<ServerConfig>,
+    retry_policy: RetryPolicy,
+}
+
+impl<R, TB> TransportContext<R, TB> {
+    pub(crate) fn new(
+        runtime: R,
+        builder: TB,
+        servers: Vec<ServerConfig>,
+        retry_policy: RetryPolicy,
+    ) -> Self {
+        Self {
+            runtime,
+            builder,
+            servers,
+            retry_policy,
         }
     }
 }

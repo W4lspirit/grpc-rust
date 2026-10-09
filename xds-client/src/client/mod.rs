@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 
 use crate::client::config::ClientConfig;
 use crate::client::watch::ResourceWatcher;
-use crate::client::worker::{AdsWorker, WatchEvent, WatcherId, WorkerCommand};
+use crate::client::worker::{AdsWorker, TransportContext, WatchEvent, WatcherId, WorkerCommand};
 use crate::codec::XdsCodec;
 use crate::metrics::MetricsRecorder;
 use crate::resource::{DecodedResource, DecoderFn, Resource};
@@ -119,14 +119,20 @@ where
         let worker = AdsWorker::new(
             self.codec,
             self.runtime.clone(),
-            self.config,
+            &self.config,
             command_tx.clone(),
             command_rx,
             self.recorder,
         );
+        let transport_context = TransportContext::new(
+            self.runtime.clone(),
+            self.transport_builder,
+            self.config.servers,
+            self.config.retry_policy,
+        );
 
         self.runtime.spawn(async move {
-            worker.run(self.transport_builder).await;
+            worker.run(transport_context).await;
         });
 
         XdsClient { command_tx }
